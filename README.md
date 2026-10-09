@@ -91,8 +91,9 @@ PASS  --out without --apply writes nothing at all  <-- pinned defect
 PASS  an oversized file is named as skipped, never dropped  <-- pinned defect
 ...
 PASS  an unknown --min-class is rejected
+PASS  a unique prefix of --apply is refused by the parser  <-- pinned defect
 ----------------------------------------------------------------------
-172 assertions, 0 failed
+173 assertions, 0 failed
 ```
 
 ## Requirements
@@ -107,8 +108,8 @@ git clone https://github.com/uhsear/clonedrift.git
 python clonedrift.py --self-test
 ```
 
-The self-test was run on Windows with Python 3.9 and Python 3.13, and on Linux with Python 3.12.
-All three report 172 assertions and 0 failed.
+The self-test was run on Windows with Python 3.13 and Python 3.12.
+Both report 173 assertions and 0 failed.
 
 ## Usage
 

@@ -1098,6 +1098,9 @@ def self_test():
     check(_parse(["--self-test"]).self_test, "--self-test parses with no path")
     raises(lambda: _parse(["tree", "--min-class", "scary"]),
            "an unknown --min-class is rejected", SystemExit)
+    raises(lambda: _parse(["tree", "--ap"]),
+           "a unique prefix of --apply is refused by the parser"
+           "  <-- pinned defect", SystemExit)
 
     print("-" * 70)
     total = passed[0] + len(failed)
@@ -1115,6 +1118,7 @@ def self_test():
 def _parse(argv):
     ap = argparse.ArgumentParser(
         prog="clonedrift.py",
+        allow_abbrev=False,
         description="Group scripts that share a name, and rank what the "
                     "copies disagree about.",
         epilog="Nothing is written without --apply.",
