@@ -2,7 +2,8 @@
 
 Name every script on a share that exists in more than one version, and say what the versions
 disagree about. Exits non-zero when two copies of one script disagree about a call that destroys
-data.
+data. With `--parity`, it also reads a Markdown parity table and opens the copies, to catch a table
+that says "identical" after the copies have diverged.
 
 A nightly job pulls a parcel roll off a vendor host, empties the production feature class and
 appends what it got. Somebody finds the bug, fixes it, tests it, and goes home. Nothing changes at
@@ -16,6 +17,20 @@ the message that announces them, commented out. Run the wrong copy and the extra
 A byte-for-byte deduplicator sees none of this, because the copies are not identical. Nobody on
 the team can say from memory which copy the scheduler runs. Opened on its own, every copy looks
 correct.
+
+There is a second way to lose that argument. The team keeps a parity table: a Markdown file that
+lists each script, its deployed copy and its backup, and a column that says "identical". The
+column was filled in by comparing file sizes. Later somebody changes one letter of the load
+script, which keeps its length, and the table goes on saying yes. In the same table, the Windows
+paths were pasted through a Python string, where `\a` is the BEL character, so `C:\arcgis` became
+`C:` plus a control byte plus `rcgis`. That path never named a folder, and nothing flagged it. Each
+row of the table was believed because the table had been right once.
+
+`--parity` checks the table instead of trusting it. It also refuses to call a path "missing" when
+the honest answer is "I could not look": a Windows path read on Linux is *foreign*, a placeholder
+or a relative path with no base is *ambiguous*, and a path with a control byte is *corrupt*.
+Without those classes, every row of a table written on another kind of host is a false alarm, and
+the report is ignored.
 
 ```
 $ python clonedrift.py --self-test
@@ -77,6 +92,28 @@ PASS  a file is never paired with its own name  <-- pinned defect
 ...
 PASS  three copies of one content report two content pairs, not five  <-- pinned defect
 ...
+PASS  a claim that rests on size alone is still a claim of identical
+...
+PASS  a span with only a drive colon and a BEL is still a path  <-- pinned defect
+...
+PASS  a header's folders do not leak into the table after it  <-- pinned defect
+...
+PASS  a form feed or BEL inside a path does not tear the row  <-- pinned defect
+...
+PASS  a drive path is foreign on a posix host, not missing  <-- pinned defect
+...
+PASS  an admin share is not mistaken for a variable  <-- pinned defect
+...
+PASS  a path with a BEL is corrupt, never a missing file  <-- pinned defect
+...
+PASS  a drive-relative path is ambiguous  <-- pinned defect
+...
+PASS  a prefix matches whole folder names only  <-- pinned defect
+...
+PASS  same size and different bytes is false  <-- pinned defect
+...
+PASS  one local copy and one foreign is unverifiable, not missing  <-- pinned defect
+...
 PASS  bytes that are not UTF-8 fall back to latin-1  <-- pinned defect
 ...
 PASS  the walk never descends into __pycache__  <-- pinned defect
@@ -90,10 +127,21 @@ PASS  --out without --apply writes nothing at all  <-- pinned defect
 ...
 PASS  an oversized file is named as skipped, never dropped  <-- pinned defect
 ...
+PASS  a size-only claim is shown to be size-only  <-- pinned defect
+...
+PASS  the report never echoes a raw control byte and is pure ASCII  <-- pinned defect
+...
+PASS  a parity run writes nothing under the tree  <-- pinned defect
+...
+PASS  --map makes the foreign path checkable  <-- pinned defect
+...
+PASS  a unique prefix of --parity is refused by the parser  <-- pinned defect
+PASS  a shorter prefix of --apply is refused by the parser  <-- pinned defect
+...
 PASS  an unknown --min-class is rejected
 PASS  a unique prefix of --apply is refused by the parser  <-- pinned defect
 ----------------------------------------------------------------------
-173 assertions, 0 failed
+321 assertions, 0 failed
 ```
 
 ## Requirements
@@ -108,8 +156,17 @@ git clone https://github.com/uhsear/clonedrift.git
 python clonedrift.py --self-test
 ```
 
-The self-test was run on Windows with Python 3.13 and Python 3.12.
-Both report 173 assertions and 0 failed.
+The self-test was run on Windows with Python 3.13, 3.12, 3.10 and 3.9, and on Linux with Python
+3.12. All five report 321 assertions and 0 failed. The count is equal on every host because no
+assertion branches on the operating system: the path-class tests pass the host in as an argument,
+and the filesystem tests build their paths with `os.path.join`.
+
+Branch coverage of `clonedrift.py` is 100 percent (1209 statements, 290 branches), measured on
+Windows with `coverage run --branch clonedrift.py --self-test`. One line is excluded by a
+`# pragma: no cover` comment: the `if __name__ == "__main__"` guard, because the self-test calls
+`main()` directly and never starts the file as a script. `coverage` is not installed on the Linux
+host, so coverage was not measured there. `pyflakes` is clean, and `python -W error` compiles the
+file on Windows and on Linux.
 
 ## Usage
 
@@ -121,6 +178,8 @@ python clonedrift.py /path/to/share --show-diff
 python clonedrift.py /path/to/share --min-class cosmetic --fail-on path
 python clonedrift.py /path/to/share --near 0.8
 python clonedrift.py /path/to/share --out drift.json --apply
+python clonedrift.py --parity PARITY.md --base /path/to/copies
+python clonedrift.py --parity PARITY.md --map "C:\work=/mnt/work" --strict
 ```
 
 The scan is read-only. The JSON report is written only with `--apply`.
@@ -182,7 +241,96 @@ Every name, host and path in that example is invented for this README.
 | `--show-diff` | off | Print the diff between the first two versions of each group. |
 | `--out` | none | Path for a JSON report. |
 | `--apply` | off | Write `--out`. Without it nothing is written. |
+| `--parity` | none | Markdown parity table to check. Replaces `path`. |
+| `--base` | none | With `--parity`: folder that relative paths in the table are read against. |
+| `--map` | none | With `--parity`: `PREFIX=FOLDER`, read paths under `PREFIX` from `FOLDER`. Repeatable. |
+| `--strict` | off | With `--parity`: also exit 1 on rows that were only partly checked, or not at all. |
 | `--self-test` | off | Run the offline assertions and exit. |
+
+Every parser option is spelled out in full: the parser is built with `allow_abbrev=False`, so
+`--ap` for `--apply`, `--app`, `--par` for `--parity` and `--str` for `--strict` are all refused. A
+mistyped prefix cannot turn a check into a write.
+
+## Checking a parity table
+
+The input is a Markdown table. Two shapes are read.
+
+```
+| Script  | Copy A                 | Copy B            | Identical? |
+|---------|------------------------|-------------------|------------|
+| rollup  | `C:\shared\rollup.py`  | `deployed/rollup.py` | **YES** |
+
+| File       | `deployed/` | `backup/` | Identical?     |
+|------------|-------------|-----------|----------------|
+| notes.md   | 35 B        | 35 B      | size-identical |
+```
+
+In the first, each row names its copies in backticks. In the second, the header names one folder
+per column, and each row's first cell is a file name that is joined to each folder. A row is
+checked when its words claim the copies are the same (`identical`, `in parity`, `byte-for-byte`,
+`same`, `match`, `yes`) and say nothing against it. A row that says they differ, or says both, is
+counted and left alone. A byte count (`33,782 B`) or a hex digest of 32, 40 or 64 digits that
+sits in the same cell as a path is checked against the file too.
+
+A real run, on Linux with Python 3.12, over a synthetic share. The table names five rows that claim
+identical copies. The BEL byte in the fourth is really in the file.
+
+```
+$ python3 clonedrift.py --parity PARITY.md --base .
+parity table PARITY.md: 5 row(s) claim identical copies
+  false=1  missing=0  corrupt=1  stale=0  unverifiable=2  partial=0  held=1
+1 row(s) not judged: 1 say the copies differ, 0 say both, 0 say nothing, 0 name fewer than two paths
+
+FALSE        line 6  the table says identical, the bytes differ
+    checked  'deployed/loader.sql'  47 B  sha256 7d1985ae2893
+    checked  'backup/loader.sql'  47 B  sha256 8db88dd6daac
+    same size (47 B), different bytes: a size-only check calls these identical
+
+CORRUPT      line 12  a path holds a control byte, so it never named a file
+    checked  'deployed/nightly.py'  17 B  sha256 9b9aad386771
+    corrupt 'C:\x07rcgis\\nightly.py': control byte 0x07 at offset 2, read as 'C:\\arcgis\\nightly.py'
+
+UNVERIFIABLE line 10  fewer than two copies could be checked on this host
+    checked  'deployed/rollup.py'  16 B  sha256 d75f0c535078
+    foreign 'C:\\shared\\gis\\rollup.py': a Windows path on a posix host; add --map
+
+UNVERIFIABLE line 11  fewer than two copies could be checked on this host
+    checked  'backup/rollup.py'  16 B  sha256 d75f0c535078
+    ambiguous '/data/<HOST>/mount.sh': placeholder, variable or wildcard
+
+FAIL: 2 row(s) claim identical copies that the files do not bear out.
+```
+
+Paths are printed escaped, so a control byte shows as `\x07` and the report stays plain ASCII. The
+share and the table are invented for this README. The two `UNVERIFIABLE` rows exit 0 by default.
+`--strict` turns them, and any `PARTIAL` row, into exit 1: the same table gives `FAIL: 4 row(s)`.
+`--map "C:\shared\gis=deployed"` makes the first of them checkable, and that row then holds.
+
+Run on Windows, the same table reports the `C:\shared\gis\rollup.py` row as `MISSING` instead.
+That is correct: a Windows host can open a drive path, and the file is not there. The class
+depends on the host, by design.
+
+### Path classes
+
+| Class | Example | What happens |
+|---|---|---|
+| local | `C:\gis\a.txt` on Windows, `/srv/a` on Linux, a relative path with `--base` | Opened and hashed. |
+| foreign | `C:\gis\a.txt` or `\\srv\share\a` on Linux, `/srv/a` on Windows, a `https://` url | Not opened. Becomes checkable with `--map`. |
+| ambiguous | `<HOST>\a`, `%TEMP%\a`, `$HOME/a`, `*.csv`, `\Users\a`, `~/a`, `C:docs\a`, a relative path with no `--base`, `/srv/a\b` | Not opened. Means a different file depending on state the table does not hold. |
+| corrupt | `C:` plus a BEL plus `rcgis` | Not opened. The message names the byte, its offset and the path it was before the escape ate it. |
+
+None of the last three is ever reported as a missing file. "I could not look" is not "it is not
+there". A row with fewer than two checkable copies is `UNVERIFIABLE`, and a row where some copies
+matched and others could not be checked is `PARTIAL`.
+
+### Verdicts
+
+From worst to best: `FALSE` (bytes differ), `MISSING` (a named copy cannot be opened), `CORRUPT`,
+`STALE` (a size or digest stated in the table is not what the file is now), `UNVERIFIABLE`,
+`PARTIAL`, `HELD`. A row with several problems takes the worst and lists all of them. Exit 1 on
+`FALSE`, `MISSING`, `CORRUPT` or `STALE`; with `--strict`, also on `UNVERIFIABLE` and `PARTIAL`.
+Exit 2 if the table is missing, over the read limit or holds no row that claims identical copies,
+or if `--base` is not a folder.
 
 ## What it checks
 
@@ -218,11 +366,33 @@ Every name, host and path in that example is invented for this README.
   their five-token shingle sets. This is the case basename grouping cannot see: the copy somebody
   saved as `roadsync_old.py`.
 
+- **Whether a parity table is telling the truth, with `--parity`.** Each row that claims identical
+  copies is checked by hashing the files with sha256, not by size or time. Rows whose copies have
+  equal size and different bytes are called out as such. See "Checking a parity table".
+- **Why a path is not checkable.** Foreign, ambiguous and corrupt are separate classes, each with a
+  reason, so a table written on another kind of host does not fill the report with false
+  "missing" rows. The class rules rest on these sources:
+  - Python: `\a` in a string literal is the ASCII Bell, and `\f`, `\v`, `\t`, `\r` and `\n` are
+    single control characters too. An unrecognised escape such as `\g` keeps its backslash, which
+    is why only some Windows folder names break
+    (https://docs.python.org/3/reference/lexical_analysis.html, "Escape sequences").
+  - Windows: file names cannot hold characters 1 to 31 or NUL. A path starting with a single
+    backslash is relative to the current drive, and `C:tmp.txt` is relative to the current directory
+    on drive C, so neither names one file without outside state. `D:\` and `d:\` are one volume,
+    and a UNC name starts with two backslashes
+    (https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file and
+    https://learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats).
+  - POSIX: a file name may hold any byte except NUL and slash, so a backslash in a Linux path is
+    part of a name, not a separator, and a Windows path means nothing there
+    (https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap03.html, "Filename").
+
 ## Exit codes
 
 0 no group at or above `--fail-on`, 1 at least one group at or above it, 2 the path does not exist
 or nothing could be scanned, 64 usage error. A flag value argparse itself rejects, such as a
 `--near` that is not a number or an unknown `--min-class`, is argparse's own error and exits 2.
+With `--parity`, the codes are those in "Verdicts" above, and passing both a path and `--parity`,
+or `--base`, `--map` or `--strict` without `--parity`, is a usage error that exits 64.
 
 ## What it measured
 
@@ -251,6 +421,15 @@ the product. The clone detection underneath it is deliberately simple.
 
 It is also not a linter. `ruff` and `pylint` read one file at a time and have no concept of a
 second copy of it.
+
+For `--parity`, the plain answer to "are these two files the same" already exists and is good:
+`sha256sum -c`, `diff -rq`, `fc /b` and Python's `filecmp` all compare bytes, and any of them is
+the right tool when you already have the list of pairs. They do not read the pairs out of a table,
+they do not notice the claim was made from sizes, and they report a Windows path on a Linux host
+as an error. Public repositories named `docdrift` exist too, and the one found by a search for the
+name describes itself as checking the paths, links and repositories cited in Markdown against the
+real tree. That asks whether a cited path exists. This asks whether two copies that the table
+says are the same still hold the same bytes.
 
 ## Limits
 
@@ -284,6 +463,28 @@ second copy of it.
   with an owner, and this tool does not have that owner's context.
 - A clean result means no two copies of one name disagree. It does not mean the surviving copy is
   correct.
+- `--parity` reads Markdown tables only, one row per line. A path that held a `\n` escape became a
+  real line feed, which splits the row in two. The first half is then counted under "say nothing"
+  and the second half is not a row, so the claim is never judged. A path with a BEL, form feed,
+  tab or carriage return in it is kept whole.
+- A path is found in a table only inside backticks, or as a whole cell that starts with a drive
+  letter, `\\`, or `/`. A bare file name in backticks is treated as a label, not a place.
+- A row is judged by its words. `identical`, `in parity`, `byte-for-byte`, `same`, `match` and
+  `yes` claim sameness, and `not`, `differ`, `diverged`, `stale`, `mismatch`, `split` and `no`
+  deny it. A cell that says "not identical" contains both and is skipped as mixed. A table written
+  in another language will find no claim and exit 2.
+- A byte count or digest is attached to a path only when it is in the same cell, or, in the
+  folder-per-column shape, in that folder's column. A size in a separate column of a row-per-copy
+  table is ignored.
+- The class of a path depends on the host that runs the tool. The same table can report a row as
+  `UNVERIFIABLE` on Linux and `MISSING` on Windows. `--map` prefixes match whole folder names and
+  ignore case, which is right for Windows prefixes and loose for POSIX ones.
+- Modification time is not read. A table older than the files it describes is not flagged on its
+  own; the byte comparison is what catches it.
+- A control byte other than the seven with a backslash escape is shown as `\xNN`, and the "read
+  as" hint cannot tell which original text produced it.
+- Not exercised: a real 16 MB table (the test lowers the limit instead). No code path in this tool
+  opens a socket or reads a credential, so there is no stub server to run and nothing to grep for.
 
 ## Contributing
 
