@@ -49,6 +49,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import tokenize
@@ -130,6 +131,11 @@ PLACEHOLDER_RE = re.compile(r"<[^<>]+>|%\w+%|\$\{?\w+|[*?]")
 WINDOWS_ABS_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\\w)")
 DRIVE_REL_RE = re.compile(r"^[A-Za-z]:(?![\\/])")
 URL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]+://")
+# A device-prefixed name with a drive or UNC after it is an ordinary file in a
+# longer spelling. Any other such name is a device: COM1, a disk, a pipe.
+DEVICE_RE = re.compile(r"^\\\\[?.]\\")
+DEVICE_FILE_RE = re.compile(r"^\\\\[?.]\\(?:[A-Za-z]:\\|[Uu][Nn][Cc]\\)")
+DOUBLE_SLASH_RE = re.compile(r"^//[^/]")
 
 # =============================================================================
 # End of CONFIGURATION.
@@ -643,6 +649,10 @@ class Finding(object):
         return VERDICTS.index(self.verdict)
 
 
+class NotRegular(OSError):
+    """A path a table names is a folder, device or pipe, not a file."""
+
+
 def claim_of(text):
     """What a row's words say: SAME, DIFFERS, MIXED or NO_CLAIM."""
     said_same = bool(CLAIM_SAME_RE.search(text))
@@ -819,6 +829,14 @@ def classify_path(text, host, base=None, maps=()):
         return CORRUPT, None, (
             "control byte 0x%02x at offset %d, read as %s"
             % (ord(found.group(0)), found.start(), ascii(escape_hint(text))))
+    if DEVICE_FILE_RE.match(text):
+        inner = text[4:]
+        if inner[:4].upper() == "UNC\\":
+            inner = "\\\\" + inner[4:]
+        klass, where, why = classify_path(inner, host, base, maps)
+        return klass, (text if where == inner else where), why
+    if DEVICE_RE.match(text):
+        return AMBIGUOUS, None, "a Windows device path, not a file"
     if PLACEHOLDER_RE.search(text):
         return AMBIGUOUS, None, "placeholder, variable or wildcard"
     if URL_RE.match(text):
@@ -830,6 +848,14 @@ def classify_path(text, host, base=None, maps=()):
         if host == "nt":
             return LOCAL, text, ""
         return FOREIGN, None, "a Windows path on a posix host; add --map"
+    if DOUBLE_SLASH_RE.match(text):
+        # Windows folds / to \ and reads a leading pair as UNC. POSIX leaves a
+        # leading pair implementation-defined.
+        if host == "nt":
+            return LOCAL, text, ""
+        return AMBIGUOUS, None, (
+            "two leading slashes: a UNC share on Windows, "
+            "implementation-defined on posix")
     if text[:1] in ("\\", "~"):
         return AMBIGUOUS, None, "rooted or home-relative with no drive or user"
     if DRIVE_REL_RE.match(text):
@@ -863,6 +889,7 @@ def judge(entry, host, base, maps, measure_fn):
     details = []
     paths = []
     checked = []
+    seen = {}
     unchecked = 0
     for item in entry.items:
         klass, where, why = classify_path(item.text, host, base, maps)
@@ -874,9 +901,24 @@ def judge(entry, host, base, maps, measure_fn):
             unchecked += 1
             notes.append("%s %s: %s" % (klass, ascii(item.text), why))
         else:
+            # One file named twice is not two copies, and "identical" to
+            # itself is the vacuous way for a row to be true. realpath folds
+            # dot segments and symbolic links; a hard link it cannot see.
+            key = os.path.normcase(os.path.realpath(where))
+            if key in seen:
+                notes.append("%s is the same file as %s: one file is not a "
+                             "copy of itself" % (ascii(item.text),
+                                                 ascii(seen[key])))
+                continue
+            seen[key] = item.text
             algo = digest_algo(item.digest)
             try:
                 size, sums = measure_fn(where, [algo] if algo else [])
+            except NotRegular:
+                flags.add(V_MISSING)
+                notes.append("not a regular file (folder, device or pipe): "
+                             "%s" % ascii(item.text))
+                continue
             except (IOError, OSError):
                 flags.add(V_MISSING)
                 notes.append("missing or unreadable: %s" % ascii(item.text))
@@ -971,6 +1013,18 @@ def decode(data):
         return data.decode("latin-1")
 
 
+def decode_table(data):
+    """Decode a parity table: UTF-8 with or without a BOM, or UTF-16 with one.
+
+    Windows PowerShell 5.1 writes UTF-16LE for > and Out-File, and UTF-8 with a
+    BOM for -Encoding utf8. A BOM left in the text would hide the header row.
+    """
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16", "replace")
+    text = decode(data)
+    return text[1:] if text[:1] == u"\ufeff" else text
+
+
 def read_bytes(path):
     """The bytes of one file, or Unreadable when it is over the read limit."""
     handle = open(path, "rb")
@@ -995,7 +1049,11 @@ def measure(path, algos=()):
 
     sha256 is always taken. The others are the algorithms a parity table named
     in its own hash cells, so the table's claim can be checked as it was made.
+    A table can name anything, so only a regular file is opened: a device such
+    as /dev/zero never ends, and a pipe blocks.
     """
+    if not stat.S_ISREG(os.stat(path).st_mode):
+        raise NotRegular(path)
     hashers = dict((name, hashlib.new(name))
                    for name in set(algos) | set(["sha256"]))
     size = 0
@@ -1634,12 +1692,37 @@ def self_test():
     check(cls("C:\\workshop\\a", "posix", None,
               [("C:\\work", "/mnt/w")])[0] == FOREIGN,
           "a prefix matches whole folder names only  <-- pinned defect")
+    ext_drive = "\\\\?\\C:\\gis\\a.txt"
+    check(cls(ext_drive, "nt")[:2] == (LOCAL, ext_drive)
+          and cls(ext_drive, "posix")[0] == FOREIGN,
+          "an extended-length drive path is a file, not a wildcard"
+          "  <-- pinned defect")
+    check(cls("\\\\?\\UNC\\srv\\share\\a", "posix")[0] == FOREIGN
+          and cls("\\\\?\\UNC\\srv\\share\\a", "nt")[0] == LOCAL
+          and cls("\\\\.\\C:\\gis\\a.txt", "nt")[0] == LOCAL,
+          "an extended-length UNC path and a \\\\.\\ drive path are files too")
+    check(cls("\\\\?\\C:\\work\\a", "posix", None,
+              [("C:\\work", "/mnt/w")])[1] == os.path.join("/mnt/w", "a"),
+          "a mapping reaches a path through the extended-length prefix")
+    for text in ("\\\\.\\PhysicalDrive0", "\\\\.\\COM1", "\\\\.\\pipe\\x",
+                 "\\\\?\\GLOBALROOT\\Device\\x"):
+        klass, where, why = cls(text, "nt")
+        check(klass == AMBIGUOUS and where is None and "device" in why,
+              "%s is a device, never opened  <-- pinned defect" % text)
+    check(cls("//srv/share/a", "nt")[:2] == (LOCAL, "//srv/share/a")
+          and cls("//srv/share/a", "posix")[0] == AMBIGUOUS,
+          "two leading slashes are a UNC share on Windows, ambiguous on posix"
+          "  <-- pinned defect")
+    check(cls("///srv/a", "posix")[:2] == (LOCAL, "///srv/a"),
+          "three leading slashes are one slash on posix")
 
     # ---- judging one claim, with the reading replaced by a dict
     store = {}
 
     def fake(path, algos):
         key = path.replace("\\", "/")
+        if key == "/dir":
+            raise NotRegular(key)
         if key not in store:
             raise IOError("no such file")
         data = store[key]
@@ -1698,6 +1781,25 @@ def self_test():
     check(odd.verdict == V_MISSING and "\\xe9" in odd.notes[0]
           and all(ord(c) < 128 for n in odd.notes for c in n),
           "a non-ASCII path is escaped in the report")
+    twice = verdict_of(ent("/a/x", "/a/./x"))
+    check(twice.verdict == V_UNVERIFIABLE and "same file" in twice.notes[0]
+          and len(twice.details) == 1,
+          "one file named twice is not two copies  <-- pinned defect")
+    thrice = verdict_of(ent("/a/x", "/a/../a/x", "/b/x"))
+    check(thrice.verdict == V_HELD and len(thrice.details) == 2
+          and len(thrice.notes) == 1,
+          "a repeat is dropped and the two real copies still hold")
+    folder = verdict_of(ent("/a/x", "/dir"))
+    check(folder.verdict == V_MISSING
+          and "not a regular file" in folder.notes[0],
+          "a folder named as a copy is reported as not a file, not opened")
+    check(decode_table(b"| a |") == "| a |"
+          and decode_table(b"\xef\xbb\xbf| a |") == "| a |"
+          and decode_table("| a |\n".encode("utf-16")) == "| a |\n"
+          and decode_table(b"\xfe\xff" + "| a |".encode("utf-16-be"))
+          == "| a |",
+          "a table in UTF-8, UTF-8 with a BOM or UTF-16 is read as text"
+          "  <-- pinned defect")
 
     sized = Entry(1, [Item("/a/x", size=3), Item("/b/x", size=3)])
     check(verdict_of(sized).verdict == V_HELD, "a stated size that is right holds")
@@ -1906,6 +2008,9 @@ def self_test():
               "a file larger than one read chunk is measured whole")
         raises(lambda: measure(at("copy_a", "nowhere.txt")),
                "measuring a file that is not there raises OSError", OSError)
+        raises(lambda: measure(os.path.join(tree, "copy_a")),
+               "measuring a folder raises NotRegular, it is never read",
+               NotRegular)
 
         def table(rows, head="| Copies | Identical? |\n|---|---|\n"):
             body = "".join("| %s | %s |\n"
@@ -2024,6 +2129,28 @@ def self_test():
         code, text = run_main(["--parity", shape_path])
         check(code == 1 and "held=1" in text and "false=1" in text,
               "a table with one folder per column is joined and checked")
+        raw_shape = read_bytes(shape_path)
+        for label, blob in (("a UTF-8 BOM", b"\xef\xbb\xbf" + raw_shape),
+                            ("UTF-16", raw_shape.decode("utf-8")
+                             .encode("utf-16"))):
+            bom_path = os.path.join(tree, "bom.md")
+            write(bom_path, blob)
+            code, text = run_main(["--parity", bom_path])
+            check(code == 1 and "held=1" in text and "false=1" in text,
+                  "a table saved with %s is read like any other"
+                  "  <-- pinned defect" % label)
+
+        twice_table = table([((a_same, os.path.join(
+            tree, "copy_a", "..", "copy_a", "same.txt")), "identical")])
+        code, text = run_main(["--parity", twice_table])
+        check(code == 0 and "unverifiable=1" in text and "same file" in text
+              and "held=0" in text,
+              "a row naming one file twice is not held  <-- pinned defect")
+        dir_table = table([((a_same, os.path.join(tree, "copy_b")),
+                            "identical")])
+        code, text = run_main(["--parity", dir_table])
+        check(code == 1 and "not a regular file" in text,
+              "a folder in a row is reported, not read, and the run fails")
 
         empty_path = os.path.join(tree, "empty.md")
         write(empty_path, b"| a | b |\n|---|---|\n| x | y |\n")
@@ -2170,7 +2297,7 @@ def run_parity(args):
               file=sys.stderr)
         return 2
     try:
-        text = decode(read_bytes(args.parity))
+        text = decode_table(read_bytes(args.parity))
     except Unreadable as exc:
         print("error: %s: %s" % (args.parity, exc), file=sys.stderr)
         return 2

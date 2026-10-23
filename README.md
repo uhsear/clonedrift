@@ -109,10 +109,19 @@ PASS  a path with a BEL is corrupt, never a missing file  <-- pinned defect
 PASS  a drive-relative path is ambiguous  <-- pinned defect
 ...
 PASS  a prefix matches whole folder names only  <-- pinned defect
+PASS  an extended-length drive path is a file, not a wildcard  <-- pinned defect
+...
+PASS  \\.\PhysicalDrive0 is a device, never opened  <-- pinned defect
+...
+PASS  two leading slashes are a UNC share on Windows, ambiguous on posix  <-- pinned defect
 ...
 PASS  same size and different bytes is false  <-- pinned defect
 ...
 PASS  one local copy and one foreign is unverifiable, not missing  <-- pinned defect
+...
+PASS  one file named twice is not two copies  <-- pinned defect
+...
+PASS  a table in UTF-8, UTF-8 with a BOM or UTF-16 is read as text  <-- pinned defect
 ...
 PASS  bytes that are not UTF-8 fall back to latin-1  <-- pinned defect
 ...
@@ -135,19 +144,24 @@ PASS  a parity run writes nothing under the tree  <-- pinned defect
 ...
 PASS  --map makes the foreign path checkable  <-- pinned defect
 ...
+PASS  a table saved with a UTF-8 BOM is read like any other  <-- pinned defect
+PASS  a table saved with UTF-16 is read like any other  <-- pinned defect
+PASS  a row naming one file twice is not held  <-- pinned defect
+...
 PASS  a unique prefix of --parity is refused by the parser  <-- pinned defect
 PASS  a shorter prefix of --apply is refused by the parser  <-- pinned defect
 ...
 PASS  an unknown --min-class is rejected
 PASS  a unique prefix of --apply is refused by the parser  <-- pinned defect
 ----------------------------------------------------------------------
-321 assertions, 0 failed
+339 assertions, 0 failed
 ```
 
 ## Requirements
 
 Python 3.9 or later. Standard library only: `argparse`, `difflib`, `hashlib`, `io`, `json`, `os`,
-`re`, `sys` and `tokenize`, with `shutil` and `tempfile` for the self-test's own temporary tree.
+`re`, `stat`, `sys` and `tokenize`, with `shutil` and `tempfile` for the self-test's own temporary
+tree.
 No `arcpy`, no `git`, no network and no credentials. It runs the same on ArcGIS Pro's Python and
 on a plain `python3`.
 
@@ -157,11 +171,11 @@ python clonedrift.py --self-test
 ```
 
 The self-test was run on Windows with Python 3.13, 3.12, 3.10 and 3.9, and on Linux with Python
-3.12. All five report 321 assertions and 0 failed. The count is equal on every host because no
+3.12. All five report 339 assertions and 0 failed. The count is equal on every host because no
 assertion branches on the operating system: the path-class tests pass the host in as an argument,
 and the filesystem tests build their paths with `os.path.join`.
 
-Branch coverage of `clonedrift.py` is 100 percent (1209 statements, 290 branches), measured on
+Branch coverage of `clonedrift.py` is 100 percent (1274 statements, 312 branches), measured on
 Windows with `coverage run --branch clonedrift.py --self-test`. One line is excluded by a
 `# pragma: no cover` comment: the `if __name__ == "__main__"` guard, because the self-test calls
 `main()` directly and never starts the file as a script. `coverage` is not installed on the Linux
@@ -272,51 +286,72 @@ checked when its words claim the copies are the same (`identical`, `in parity`, 
 counted and left alone. A byte count (`33,782 B`) or a hex digest of 32, 40 or 64 digits that
 sits in the same cell as a path is checked against the file too.
 
-A real run, on Linux with Python 3.12, over a synthetic share. The table names five rows that claim
-identical copies. The BEL byte in the fourth is really in the file.
+A real run, on Linux with Python 3.12, over a synthetic share. The table names eight rows that claim
+identical copies. The BEL byte in the fourth is really in the file. The table is saved as UTF-8,
+and the same table saved as UTF-16 (what Windows PowerShell 5.1 writes for `>`) gives the same counts.
 
 ```
 $ python3 clonedrift.py --parity PARITY.md --base .
-parity table PARITY.md: 5 row(s) claim identical copies
-  false=1  missing=0  corrupt=1  stale=0  unverifiable=2  partial=0  held=1
-1 row(s) not judged: 1 say the copies differ, 0 say both, 0 say nothing, 0 name fewer than two paths
+parity table PARITY.md: 8 row(s) claim identical copies
+  false=1  missing=1  corrupt=1  stale=0  unverifiable=4  partial=0  held=1
+0 row(s) not judged: 0 say the copies differ, 0 say both, 0 say nothing, 0 name fewer than two paths
 
-FALSE        line 6  the table says identical, the bytes differ
-    checked  'deployed/loader.sql'  47 B  sha256 7d1985ae2893
-    checked  'backup/loader.sql'  47 B  sha256 8db88dd6daac
-    same size (47 B), different bytes: a size-only check calls these identical
+FALSE        line 3  the table says identical, the bytes differ
+    checked  'deployed/loader.sql'  27 B  sha256 4cf350f5ad1b
+    checked  'backup/loader.sql'  27 B  sha256 ed15b96c5ab1
+    same size (27 B), different bytes: a size-only check calls these identical
 
-CORRUPT      line 12  a path holds a control byte, so it never named a file
-    checked  'deployed/nightly.py'  17 B  sha256 9b9aad386771
+MISSING      line 9  a copy the table names is missing or cannot be read
+    checked  'deployed/rollup.py'  14 B  sha256 b83a6fbe7ee4
+    not a regular file (folder, device or pipe): '/dev/zero'
+
+CORRUPT      line 6  a path holds a control byte, so it never named a file
+    checked  'deployed/nightly.py'  11 B  sha256 e408ba48bfb9
     corrupt 'C:\x07rcgis\\nightly.py': control byte 0x07 at offset 2, read as 'C:\\arcgis\\nightly.py'
 
-UNVERIFIABLE line 10  fewer than two copies could be checked on this host
-    checked  'deployed/rollup.py'  16 B  sha256 d75f0c535078
+UNVERIFIABLE line 4  fewer than two copies could be checked on this host
+    checked  'deployed/rollup.py'  14 B  sha256 b83a6fbe7ee4
     foreign 'C:\\shared\\gis\\rollup.py': a Windows path on a posix host; add --map
 
-UNVERIFIABLE line 11  fewer than two copies could be checked on this host
-    checked  'backup/rollup.py'  16 B  sha256 d75f0c535078
+UNVERIFIABLE line 5  fewer than two copies could be checked on this host
+    checked  'backup/rollup.py'  14 B  sha256 b83a6fbe7ee4
     ambiguous '/data/<HOST>/mount.sh': placeholder, variable or wildcard
 
-FAIL: 2 row(s) claim identical copies that the files do not bear out.
+UNVERIFIABLE line 7  fewer than two copies could be checked on this host
+    checked  'backup/rollup.py'  14 B  sha256 b83a6fbe7ee4
+    foreign '\\\\?\\C:\\shared\\gis\\rollup.py': a Windows path on a posix host; add --map
+
+UNVERIFIABLE line 8  fewer than two copies could be checked on this host
+    checked  'deployed/rollup.py'  14 B  sha256 b83a6fbe7ee4
+    './deployed/rollup.py' is the same file as 'deployed/rollup.py': one file is not a copy of itself
+
+FAIL: 3 row(s) claim identical copies that the files do not bear out.
 ```
 
 Paths are printed escaped, so a control byte shows as `\x07` and the report stays plain ASCII. The
-share and the table are invented for this README. The two `UNVERIFIABLE` rows exit 0 by default.
-`--strict` turns them, and any `PARTIAL` row, into exit 1: the same table gives `FAIL: 4 row(s)`.
-`--map "C:\shared\gis=deployed"` makes the first of them checkable, and that row then holds.
+share and the table are invented for this README. The four `UNVERIFIABLE` rows exit 0 by default.
+`--strict` turns them, and any `PARTIAL` row, into exit 1: the same table gives `FAIL: 7 row(s)`.
+`--map "C:\shared\gis=deployed"` makes the first of them checkable, and that row then holds
+(`unverifiable=3`, `held=2`).
+
+Two rows in that table show the newest checks. Line 8 names `deployed/rollup.py` twice, once as
+`./deployed/rollup.py`. One file is identical to itself, so the row proved nothing and is not
+`HELD`. Line 9 names `/dev/zero`. A table can name anything, and only a regular file is opened:
+a device never ends and a pipe blocks. The same row on a Windows host reads `/dev/zero` as a foreign
+path, because Windows cannot open it.
 
 Run on Windows, the same table reports the `C:\shared\gis\rollup.py` row as `MISSING` instead.
 That is correct: a Windows host can open a drive path, and the file is not there. The class
-depends on the host, by design.
+depends on the host, by design. The long form `\\?\C:\shared\gis\rollup.py` on line 7 follows the
+same rule: foreign on Linux, a file that is not there on Windows.
 
 ### Path classes
 
 | Class | Example | What happens |
 |---|---|---|
-| local | `C:\gis\a.txt` on Windows, `/srv/a` on Linux, a relative path with `--base` | Opened and hashed. |
-| foreign | `C:\gis\a.txt` or `\\srv\share\a` on Linux, `/srv/a` on Windows, a `https://` url | Not opened. Becomes checkable with `--map`. |
-| ambiguous | `<HOST>\a`, `%TEMP%\a`, `$HOME/a`, `*.csv`, `\Users\a`, `~/a`, `C:docs\a`, a relative path with no `--base`, `/srv/a\b` | Not opened. Means a different file depending on state the table does not hold. |
+| local | `C:\gis\a.txt`, `//srv/share/a` and `\\?\C:\gis\a.txt` on Windows, `/srv/a` on Linux, a relative path with `--base` | Opened and hashed, if it is a regular file. |
+| foreign | `C:\gis\a.txt`, `\\srv\share\a` or `\\?\C:\gis\a.txt` on Linux, `/srv/a` on Windows, a `https://` url | Not opened. Becomes checkable with `--map`. |
+| ambiguous | `<HOST>\a`, `%TEMP%\a`, `$HOME/a`, `*.csv`, `\Users\a`, `~/a`, `C:docs\a`, `//srv/share/a` on Linux, `\\.\PhysicalDrive0`, a relative path with no `--base`, `/srv/a\b` | Not opened. Means a different file depending on state the table does not hold, or is a device and not a file. |
 | corrupt | `C:` plus a BEL plus `rcgis` | Not opened. The message names the byte, its offset and the path it was before the escape ate it. |
 
 None of the last three is ever reported as a missing file. "I could not look" is not "it is not
@@ -331,6 +366,11 @@ From worst to best: `FALSE` (bytes differ), `MISSING` (a named copy cannot be op
 `FALSE`, `MISSING`, `CORRUPT` or `STALE`; with `--strict`, also on `UNVERIFIABLE` and `PARTIAL`.
 Exit 2 if the table is missing, over the read limit or holds no row that claims identical copies,
 or if `--base` is not a folder.
+
+A copy that is a folder, a device or a pipe is `MISSING` with the note "not a regular file". It is
+never opened. A path named twice in one row counts once, whether it is spelled `a/x` and `a/./x`
+or one of the two is a symbolic link to the other. The row then has one copy, and one file is not a
+copy of itself. Two hard links to one file are not caught (see Limits).
 
 ## What it checks
 
@@ -369,6 +409,9 @@ or if `--base` is not a folder.
 - **Whether a parity table is telling the truth, with `--parity`.** Each row that claims identical
   copies is checked by hashing the files with sha256, not by size or time. Rows whose copies have
   equal size and different bytes are called out as such. See "Checking a parity table".
+- **A table saved by Windows PowerShell.** A UTF-8 byte-order mark in front of the header would
+  hide it from the parser, and `>` writes UTF-16. The table is read as UTF-8 with or without a mark,
+  or as UTF-16 when it opens with a UTF-16 mark.
 - **Why a path is not checkable.** Foreign, ambiguous and corrupt are separate classes, each with a
   reason, so a table written on another kind of host does not fill the report with false
   "missing" rows. The class rules rest on these sources:
@@ -384,7 +427,21 @@ or if `--base` is not a folder.
     https://learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats).
   - POSIX: a file name may hold any byte except NUL and slash, so a backslash in a Linux path is
     part of a name, not a separator, and a Windows path means nothing there
-    (https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap03.html, "Filename").
+    (https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap03.html, "Filename"). A
+    pathname that begins with exactly two slashes may be read in an implementation-defined way,
+    and three or more leading slashes are one slash
+    (https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap04.html, "Pathname
+    Resolution"). So `//srv/share/a` is ambiguous on Linux and `///srv/a` is `/srv/a`.
+  - Windows device paths: `\\?\C:\a` and `\\.\C:\a` name the same file as `C:\a`, and
+    `\\?\UNC\srv\share\a` is a UNC path. Windows folds `/` to `\` and reads two leading separators
+    as UNC, so `//srv/share/a` is a share there. A `\\.\` or `\\?\` name with anything else after it
+    (`\\.\COM1`, `\\.\PhysicalDrive0`) reaches a device. `?` after the prefix is therefore not a
+    wildcard
+    (https://learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats, "DOS device paths"
+    and "Canonicalize separators").
+  - PowerShell: in Windows PowerShell 5.1, `>` and `Out-File` write UTF-16LE with a byte-order
+    mark, and `-Encoding utf8` writes UTF-8 with one
+    (https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_character_encoding).
 
 ## Exit codes
 
@@ -426,10 +483,11 @@ For `--parity`, the plain answer to "are these two files the same" already exist
 `sha256sum -c`, `diff -rq`, `fc /b` and Python's `filecmp` all compare bytes, and any of them is
 the right tool when you already have the list of pairs. They do not read the pairs out of a table,
 they do not notice the claim was made from sizes, and they report a Windows path on a Linux host
-as an error. Public repositories named `docdrift` exist too, and the one found by a search for the
-name describes itself as checking the paths, links and repositories cited in Markdown against the
-real tree. That asks whether a cited path exists. This asks whether two copies that the table
-says are the same still hold the same bytes.
+as an error. A GitHub search for `docdrift` on 2026-10-23 returned eight public repositories. By
+their descriptions alone, one checks the paths, links and repositories cited in Markdown against
+the real tree, and one keeps project documentation in step with code through a language model. I
+read the descriptions, not the code. Both ask whether the documentation still matches the project.
+This asks whether two copies that the table says are the same still hold the same bytes.
 
 ## Limits
 
@@ -483,6 +541,18 @@ says are the same still hold the same bytes.
   own; the byte comparison is what catches it.
 - A control byte other than the seven with a backslash escape is shown as `\xNN`, and the "read
   as" hint cannot tell which original text produced it.
+- Two names for one file are matched after `os.path.realpath`, which folds dot segments and
+  symbolic links, and `os.path.normcase`, which folds case only on a host that does. A hard link is
+  not seen, so two hard links to one file look like two copies and the row is judged as a pair that
+  matches itself. The symbolic link case was exercised by hand on Linux, not in the self-test,
+  because Windows needs a privilege to make one and the assertion count would then differ.
+- A relative path under `--base` whose last part is a legacy Windows device name (`CON`, `NUL`,
+  `COM1`) is not screened. Before Windows 11 such a name may open the device (Microsoft Learn, "Handle
+  legacy devices"). It was not exercised, because no host here runs a pre-Windows 11 build.
+- A table in UTF-16 without a byte-order mark is not detected, and is read as text full of NUL
+  bytes, so the run exits 2 with "no row ... claims that copies are identical".
+- The non-regular-file check was exercised on a folder in the self-test and on `/dev/zero` in the
+  Linux run shown above. A named pipe was not tried.
 - Not exercised: a real 16 MB table (the test lowers the limit instead). No code path in this tool
   opens a socket or reads a credential, so there is no stub server to run and nothing to grep for.
 
