@@ -4,15 +4,14 @@
 A scheduled job pulls a parcel roll off a vendor host, empties the production
 feature class and appends what it got. Somebody fixes a bug in it. Nothing
 changes at 2am, because the scheduler runs a different copy. On the share this
-was built against, one script name occurs 19 times in 5 versions, and another
-occurs 15 times in 4 versions where two siblings differ by one edit and one
-stray space: one runs os.remove and rmtree on the source folder, and the other
+was built against, one script name occurs in a dozen copies, and in one group
+of them two siblings differ by one edit and one stray space: one runs os.remove and rmtree on the source folder, and the other
 has those lines commented out. Run the wrong copy and the extract is gone.
 
-jscpd and copydetect already find duplicated code, they are maintained, and
-both read Python 2 without complaint. This is not a new clone detector and does
+jscpd and copydetect already find duplicated code, and find it well. This is
+not a new clone detector and does
 not try to be one. Those tools answer "how much of this tree is duplicated".
-This one answers "which of these 15 copies has rmtree live, and which host does
+This one answers "which of these copies has rmtree live, and which host does
 each one name", by grouping whole files that share a name, collapsing copies
 that differ only in comments or whitespace, and ranking each surviving
 disagreement by whether it touches a destructive call or a path literal. A
@@ -37,11 +36,15 @@ ambiguous (a placeholder, a relative path, a drive-relative path) or corrupt (a
 control byte, which is what a pasted "\\a" leaves in a path).
 
 Exit codes: 0 clean, 1 drift at or above --fail-on (or, with --parity, a claim
-the files contradict), 2 nothing could be scanned, 64 usage error.
+the files contradict), 2 nothing could be scanned or a file could not be
+written, 3 no finding but something could not be checked (a copy that could not
+be read, a folder that could not be listed, a table row that could not be
+verified), 64 usage error. Only 0 means everything was compared.
 """
 
 
 import argparse
+import collections
 import difflib
 import hashlib
 import io
@@ -67,9 +70,8 @@ SOURCE_EXTENSIONS = (".py", ".pyw")
 SKIP_DIRS = ("__pycache__", ".git", ".svn", ".hg", ".tox", ".eggs")
 
 # Nothing larger is read, and a file over it is named as skipped rather than
-# dropped in silence. Measured on the 743-file share: the largest file is a
-# 10.5 MB log somebody saved with a .py extension, the largest after it is a
-# 937 KB vendored library module, and nothing there reaches this limit.
+# dropped in silence. On the legacy share this was built against, a log saved
+# with a .py extension was the largest file, and it was well under this limit.
 READ_LIMIT = 16 * 1000 * 1000
 
 # Shingle length for the near-duplicate similarity. Five significant tokens is
@@ -80,13 +82,19 @@ SHINGLE_K = 5
 # Calls that destroy data. No trailing \b after a name: arcpy spells the same
 # tool TruncateTable and TruncateTable_management, and underscore is a word
 # character, so a trailing boundary would never match the suffixed form.
+# Delete( is the ArcGIS Pro spelling, arcpy.management.Delete(in_data), and
+# unlink( is os.unlink and pathlib's Path.unlink.
 DESTRUCTIVE_RE = re.compile(
     r"rmtree"
     r"|os\.remove"
-    r"|os\.unlink"
+    r"|os\.rmdir"
+    r"|\bunlink\("
+    r"|\bDelete\("
     r"|Delete_management"
+    r"|DeleteField"
     r"|DeleteFeatures"
     r"|DeleteRows"
+    r"|deleteRow"
     r"|TruncateTable"
 )
 
@@ -105,17 +113,26 @@ PATHLIKE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# user:password@ inside a url. A report prints literals and source lines as
+# evidence, and a legacy script holds ftp://user:password@host/ in plain text.
+# The scheme needs two characters so a drive letter (C://x@y) is never masked.
+USERINFO_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.-]+://)[^/@\s]+@")
+
 # What a parity table row says about its copies. A row claims "the same" when
 # it says so and says nothing against it. "size-identical" counts: a claim that
 # rests on size alone is exactly the claim worth testing. A row that says both
 # ("in parity with each other, both differ from the archive") is not judged,
 # because the tool cannot tell which pair the claim is about.
 CLAIM_SAME_RE = re.compile(
-    r"\b(?:identical|in parity|byte-for-byte|same|matches?|yes)\b",
+    r"\b(?:identical|in parity|byte-for-byte|same|match(?:es|ed)?|yes)\b",
     re.IGNORECASE)
 CLAIM_DIFF_RE = re.compile(
-    r"\b(?:not|differ(?:s|ent)?|diverge[ds]?|stale|mismatch(?:es)?|split)\b"
-    r"|\bno\b(?! diff)",
+    r"\b(?:not|never|differ(?:s|ent)?|diverge[ds]?|stale|mismatch(?:es)?|split"
+    r"|non-\w+)\b|n't\b|\bno\b",
+    re.IGNORECASE)
+# "no drift" and "no issues" are good news about a copy, not a denial of it.
+NO_PROBLEM_RE = re.compile(
+    r"\bno (?:drift|diff\w*|issues?|problems?|changes?|mismatch\w*)\b",
     re.IGNORECASE)
 
 # A table cell holds a path when it is a backtick span with a separator, a
@@ -189,12 +206,12 @@ def token_stream(text):
 
     The ERRORTOKEN sweep is what makes the verdict the same on every supported
     interpreter. Python 3.10 and later raise TokenError on an unterminated
-    string; Python 3.9, which ArcGIS Pro 3.0 to 3.2 ship, returns a stream with
+    string; Python 3.9, the oldest interpreter supported here, returns a stream with
     an ERRORTOKEN in it and no exception at all. Without the sweep the same
     torn file is unreadable on one interpreter and silently clean on another,
     and the promise that an unreadable copy is never called clean would hold
-    on only one of them. Measured on the 743-file share: five files are
-    unreadable, and they are the same five under 3.9 and under 3.13.
+    on only one of them. On the share this was built against, the same few
+    files are unreadable under 3.9 and under 3.13.
     """
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
@@ -264,6 +281,11 @@ def literal_text(token_string):
     return body
 
 
+def mask_userinfo(text):
+    """text with the user:password of every url in it replaced by ***."""
+    return USERINFO_RE.sub(lambda found: found.group(1) + "***@", text)
+
+
 def path_literals(tokens):
     """The host and path literals a file uses, as text.
 
@@ -292,14 +314,51 @@ def path_literals(tokens):
     return frozenset(found)
 
 
+def live_calls(text):
+    """The statements of one copy that run a destructive call, with counts.
+
+    A call counts when it is code: a name outside every comment and string. A
+    call inside a triple-quoted block is switched off, which is how a legacy
+    script disables a line without editing it. Re-indenting a line or editing
+    its comment does not change the statement, so it is not a disagreement.
+    A copy the tokenizer refuses falls back to its raw lines that do not open
+    with a comment.
+    """
+    try:
+        tokens = token_stream(text)
+    except Unreadable:
+        return collections.Counter(
+            line.strip() for line in text.splitlines()
+            if DESTRUCTIVE_RE.search(line)
+            and not line.lstrip().startswith("#"))
+    calls = collections.Counter()
+    shown, code = [], []
+    for tok in tokens:
+        if tok[0] == tokenize.NEWLINE:
+            if DESTRUCTIVE_RE.search("".join(code)):
+                calls["".join(shown)] += 1
+            shown, code = [], []
+        elif tok[0] in SIGNIFICANT:
+            word = tok[1]
+            if shown and shown[-1][-1:].isalnum() and word[:1].isalnum():
+                word = " " + word
+            shown.append(word)
+            code.append("" if tok[0] == tokenize.STRING else word)
+    return calls
+
+
 def destructive_drift(left_text, right_text):
     """Lines carrying a destructive call that the two copies disagree about.
 
-    This reads raw lines, not tokens, because the flagship case is a line that
-    one copy runs and the other has commented out. A token stream has already
+    The decision is made on live statements (see live_calls). The evidence
+    reads raw lines, not tokens, because the flagship case is a line that one
+    copy runs and the other has commented out. A token stream has already
     thrown the commented copy away, so the two would differ with no evidence
     left to explain why.
     """
+    left, right = live_calls(left_text), live_calls(right_text)
+    if left == right:
+        return []
     evidence = []
     diff = difflib.unified_diff(left_text.splitlines(),
                                 right_text.splitlines(), n=0, lineterm="")
@@ -309,7 +368,12 @@ def destructive_drift(left_text, right_text):
         body = line[1:]
         if DESTRUCTIVE_RE.search(body):
             note = " [commented out]" if body.strip().startswith("#") else ""
-            evidence.append("%s %s%s" % (line[:1], body.strip(), note))
+            evidence.append("%s %s%s" % (line[:1], mask_userinfo(body.strip()),
+                                         note))
+    if not evidence:
+        # The call was switched off without touching its own line.
+        evidence = ["~ %s [live in one copy only]" % mask_userinfo(call)
+                    for call in sorted((left - right) + (right - left))]
     return evidence
 
 
@@ -423,7 +487,7 @@ def classify(variants):
         for lit in literals:
             union |= lit
             common = lit if common is None else (common & lit)
-        return PATH, ["only in some versions: %s" % lit
+        return PATH, ["only in some versions: %s" % mask_userinfo(lit)
                       for lit in sorted(union - common)]
 
     return CODE, []
@@ -468,8 +532,8 @@ def near_pairs(sources, threshold):
     otherwise report the same rename ten times.
 
     ponytail: every readable pair is compared, which is O(n^2) over shingle
-    sets. Measured on the 743-file share, that adds about fourteen seconds to a
-    four-second scan. Before 50,000 files, prefilter on file size and on a
+    sets. On a share of several hundred files it roughly
+    quadruples the scan time. Before 50,000 files, prefilter on file size and on a
     shared basename stem so that most pairs are never scored at all.
     """
     readable = [s for s in sources if s.readable and s.shingles]
@@ -540,7 +604,7 @@ def describe(group, show_diff=False, evidence_limit=6):
         diff = difflib.unified_diff(left.text.splitlines(),
                                     right.text.splitlines(), n=1, lineterm="")
         for line in list(diff)[2:22]:
-            lines.append("      %s" % line)
+            lines.append("      %s" % mask_userinfo(line))
     return lines
 
 
@@ -611,7 +675,13 @@ DEFAULT_FAIL_AT = V_STALE
 DIGEST_ALGOS = {32: "md5", 40: "sha1", 64: "sha256"}
 SIZE_RE = re.compile(r"(?<![\w.])(\d[\d,]*)\s*B\b")
 DIGEST_RE = re.compile(r"\b(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40}|[0-9a-fA-F]{32})\b")
+SHA1_WORD_RE = re.compile(r"\b(?:sha-?1|sha|hash|digest|checksum)\b",
+                          re.IGNORECASE)
 TICK_RE = re.compile(r"`([^`\n]+)`")
+# A column with one of these headings holds commentary or a pointer to the
+# authority, not a copy of the file and not the claim about the copies.
+NOTES_HEADER_RE = re.compile(
+    r"\b(?:canonical|authority|notes?|comments?|remarks?)\b", re.IGNORECASE)
 
 # The backslash escapes Python turns into one control byte.
 ESCAPE_LETTERS = {7: "a", 8: "b", 9: "t", 10: "n", 11: "v", 12: "f", 13: "r"}
@@ -621,7 +691,7 @@ class Item(object):
     """One path a table row names, and what the row states about it."""
 
     def __init__(self, text, size=None, digest=None):
-        self.text = text
+        self.text = mask_userinfo(text)
         self.size = size
         self.digest = digest
 
@@ -655,6 +725,7 @@ class NotRegular(OSError):
 
 def claim_of(text):
     """What a row's words say: SAME, DIFFERS, MIXED or NO_CLAIM."""
+    text = NO_PROBLEM_RE.sub(" ", text)
     said_same = bool(CLAIM_SAME_RE.search(text))
     said_diff = bool(CLAIM_DIFF_RE.search(text))
     if said_same and said_diff:
@@ -701,9 +772,15 @@ def stated_size(text):
 
 
 def stated_digest(text):
-    """A 32, 40 or 64 digit hex digest a cell states, or None."""
-    found = DIGEST_RE.search(text)
-    return found.group(0).lower() if found else None
+    """A 32, 40 or 64 digit hex digest a cell states, or None.
+
+    A git commit id is 40 hex digits too, so a 40 digit string counts only when
+    the cell also says sha1, hash, digest or checksum.
+    """
+    for found in DIGEST_RE.finditer(text):
+        if len(found.group(0)) != 40 or SHA1_WORD_RE.search(text):
+            return found.group(0).lower()
+    return None
 
 
 def join_dir(directory, name):
@@ -740,15 +817,19 @@ def parse_table(text):
     entries = []
     skipped = dict((key, 0) for key in (DIFFERS, MIXED, NO_CLAIM, UNPAIRED))
     dirs = None
+    ignored = ()
     for index, cells in enumerate(rows):
         if cells is None:
             dirs = None
+            ignored = ()
             continue
         if is_separator(cells):
             continue
         following = rows[index + 1] if index + 1 < len(rows) else None
         if following is not None and is_separator(following):
             dirs = header_dirs(cells)
+            ignored = [col for col, cell in enumerate(cells)
+                       if NOTES_HEADER_RE.search(cell)]
             continue
         items = []
         if dirs:
@@ -758,15 +839,21 @@ def parse_table(text):
                     cell = cells[col] if col < len(cells) else ""
                     items.append(Item(join_dir(dirs[col], name),
                                       stated_size(cell), stated_digest(cell)))
-            said = " ".join(cells[1:])
+            said = " ".join(cell for col, cell in enumerate(cells)
+                            if col and col not in ignored)
         else:
             parts = []
-            for cell in cells:
+            for col, cell in enumerate(cells):
+                if col in ignored:
+                    continue
                 spans = cell_paths(cell)
                 rest = cell
                 for span in spans:
                     rest = rest.replace("`%s`" % span, " ").replace(span, " ")
-                parts.append(rest)
+                # A first cell that names no path labels the row. Its words
+                # ("split.py") are not a claim unless they claim sameness.
+                if spans or col or CLAIM_SAME_RE.search(cell):
+                    parts.append(rest)
                 for span in spans:
                     alone = len(spans) == 1
                     items.append(Item(
@@ -1005,10 +1092,12 @@ def decode(data):
 
     latin-1 maps every one of the 256 byte values, so it cannot fail and no
     third fallback is needed. A mis-decoded comment costs nothing here: the
-    fingerprint is taken over tokens and the identity over the raw bytes.
+    fingerprint is taken over tokens and the identity over the raw bytes. A
+    UTF-8 byte-order mark is dropped, because Notepad writes one and a copy
+    saved with it is not a second version of the copy saved without.
     """
     try:
-        return data.decode("utf-8")
+        return data.decode("utf-8-sig")
     except UnicodeDecodeError:
         return data.decode("latin-1")
 
@@ -1021,8 +1110,7 @@ def decode_table(data):
     """
     if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
         return data.decode("utf-16", "replace")
-    text = decode(data)
-    return text[1:] if text[:1] == u"\ufeff" else text
+    return decode(data)
 
 
 def read_bytes(path):
@@ -1070,12 +1158,18 @@ def measure(path, algos=()):
     return size, dict((name, h.hexdigest()) for name, h in hashers.items())
 
 
-def walk_sources(root, extensions):
-    """Every candidate file under root, or the file itself."""
+def walk_sources(root, extensions, errors=None):
+    """Every candidate file under root, or the file itself.
+
+    A folder that cannot be listed is appended to errors as (path, reason). os.walk
+    drops it in silence otherwise, and its copies would never be compared.
+    """
     if os.path.isfile(root):
         return [root]
     found = []
-    for dirpath, dirnames, filenames in os.walk(root):
+    failed = errors if errors is not None else []
+    for dirpath, dirnames, filenames in os.walk(
+            root, onerror=lambda exc: failed.append((exc.filename, str(exc)))):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for name in sorted(filenames):
             if name.lower().endswith(tuple(extensions)):
@@ -1301,6 +1395,81 @@ def self_test():
     check(destructive_drift("x = 1\n", "x = 2\n") == [],
           "an ordinary edit is not destructive drift")
 
+    # ---- destructive drift: live statements, not lines
+    for call in ("arcpy.management.Delete(fc)", "arcpy.Delete_management(fc)",
+                 "arcpy.management.DeleteField(fc, 'f')",
+                 "arcpy.DeleteField_management(fc, 'f')", "os.rmdir(d)",
+                 "Path(p).unlink()", "cur.deleteRow()"):
+        check(DESTRUCTIVE_RE.search(call),
+              "the destructive list matches %s  <-- pinned defect"
+              % call.split("(")[0])
+    check(not DESTRUCTIVE_RE.search("def Undelete(x)"),
+          "a name that only ends in Delete is not on the destructive list")
+    check(destructive_drift("os.remove('x')  # cleanup\n",
+                            "os.remove('x')  # clean up\n") == [],
+          "a comment edit beside a destructive call is not drift"
+          "  <-- pinned defect")
+    check(destructive_drift("if a:\n    shutil.rmtree(d)\n",
+                            "if a:\n        shutil.rmtree(d)\n") == [],
+          "re-indenting a destructive call is not drift  <-- pinned defect")
+    check(destructive_drift("print('rmtree done')\n", "print('done')\n") == [],
+          "a destructive name inside a message is not a call")
+    wrapped = destructive_drift(
+        "import shutil\nshutil.rmtree(d)\n",
+        "import shutil\n'''\nshutil.rmtree(d)\n'''\n")
+    check(wrapped and "live in one copy only" in wrapped[0]
+          and "shutil.rmtree(d)" in wrapped[0],
+          "a call wrapped in a triple-quoted block is drift, and is named"
+          "  <-- pinned defect")
+    check(destructive_drift("import shutil\n'''\nshutil.rmtree(d)\n'''\n",
+                            "import shutil\nshutil.rmtree(d)\n"),
+          "a call switched off in the first copy is drift too")
+    check(live_calls("def f():\n    return os.remove(f)\n")
+          == collections.Counter({"return os.remove(f)": 1}),
+          "a live statement is kept whole, with a space between two words")
+    check(live_calls("from shutil import rmtree\n")
+          == collections.Counter({"from shutil import rmtree": 1}),
+          "an import of a destructive name is a live statement too")
+    check(live_calls("msg = 'x\nshutil.rmtree(d)\n# os.remove(f)\n")
+          == collections.Counter({"shutil.rmtree(d)": 1}),
+          "a copy the tokenizer refuses is read by raw line, comments aside")
+    check(live_calls("x = 1\n") == collections.Counter(),
+          "a copy with no destructive call has no live statement")
+    leak = destructive_drift("os.remove('ftp://svc:Hunter2pw@h.example/x')\n",
+                             "# os.remove('ftp://svc:Hunter2pw@h.example/x')\n")
+    check(leak and "Hunter2pw" not in " ".join(leak) and "***@" in leak[0],
+          "a password inside a destructive line never reaches the evidence"
+          "  <-- pinned defect")
+    check(mask_userinfo("ftp://svc:pw@h/x") == "ftp://***@h/x"
+          and mask_userinfo("see C://file@x and a@b.example")
+          == "see C://file@x and a@b.example",
+          "only the user and password of a url are masked")
+    cred_a = base.replace("import shutil\n",
+                          "import shutil\nFEED = 'ftp://svc:Hunter2pw@h.example/in'\n")
+    cred_b = cred_a.replace("Hunter2pw", "Zebra99pw")
+    cred = classify([src("a.py", cred_a), src("a.py", cred_b)])
+    check(cred[0] == PATH and len(cred[1]) == 2
+          and "Hunter2pw" not in " ".join(cred[1])
+          and "Zebra99pw" not in " ".join(cred[1]),
+          "a password inside a path literal never reaches the evidence"
+          "  <-- pinned defect")
+    cred_group = analyse([src("a.py", cred_a), src("a.py", cred_b)])[0]
+    check("Hunter2pw" not in json.dumps(as_report({}, [cred_group], []))
+          and "Hunter2pw" not in "\n".join(describe(cred_group, True)),
+          "and the report and the diff do not carry it either"
+          "  <-- pinned defect")
+    check(decode(b"\xef\xbb\xbfx = 1\n") == "x = 1\n"
+          and src("a.py", decode(b"\xef\xbb\xbfx = 1\n")).version
+          == src("a.py", "x = 1\n").version,
+          "a UTF-8 byte-order mark does not make a second version"
+          "  <-- pinned defect")
+    check(lits("# header\n'''Reads D:/gis.'''\nx = 1\n") == frozenset()
+          and lits("\n\n'''Reads D:/gis.'''\nx = 1\n") == frozenset(),
+          "a docstring after a comment or a blank line is still a docstring")
+    check(tally([src("a.py", base), src("b.py", torn)], [])["unreadable"] == 1
+          and tally([src("a.py", base)], [])["unreadable"] == 0,
+          "the tally counts the files it could not read")
+
     # ---- classification and its ranking
     check(classify([src("a.py", base)])[0] == COSMETIC,
           "one surviving version classifies cosmetic")
@@ -1479,6 +1648,20 @@ def self_test():
     long_group.evidence = ["e%d" % i for i in range(9)]
     check(any("... 3 more" in line for line in describe(long_group)),
           "evidence past the limit is counted rather than printed")
+    check(len(unread_group[0].unreadable) == 1
+          and unread_group[0].unreadable[0].path == "memory/u.py"
+          and single.unreadable == [],
+          "a group lists only the copies it could not read")
+    check(not any("UNREADABLE" in line for line in describe(single)),
+          "a group of readable copies names no unreadable one")
+    check(not any("diff " in line for line in describe(single, show_diff=True)),
+          "--show-diff has nothing to say about a group of one version")
+    exact = analyse([src("m.py", base), src("m.py", commented)])[0]
+    exact.evidence = ["e%d" % i for i in range(6)]
+    check(not any("more" in line for line in describe(exact)),
+          "evidence exactly at the limit is printed whole")
+    check(len(near_pairs(renamed, pairs[0][0])) == 1,
+          "a pair that scores exactly the threshold is reported")
 
     # ---- the harness itself, driven on purpose to fail
     sink = []
@@ -1532,6 +1715,18 @@ def self_test():
                    " copy") == MIXED,
           "a row that says both is mixed, and is not judged")
     check(claim_of("pending") == NO_CLAIM, "a row that says nothing is no claim")
+    for said, kind in (("match", SAME), ("matches", SAME), ("matched", SAME),
+                       ("mismatch", DIFFERS)):
+        check(claim_of(said) == kind,
+              "'%s' reads as %s  <-- pinned defect" % (said, kind))
+    for said in ("isn't identical", "aren't the same", "non-identical",
+                 "never the same", "no longer identical"):
+        check(claim_of(said) == MIXED,
+              "'%s' is not a claim of identical  <-- pinned defect" % said)
+    for said in ("identical, no drift", "identical (no issues)",
+                 "yes - no differences", "same, no mismatch"):
+        check(claim_of(said) == SAME,
+              "'%s' is a claim of identical  <-- pinned defect" % said)
 
     # ---- parity table: cells
     check(split_row("| a\t| b |") == ["a\t", "b"],
@@ -1562,6 +1757,13 @@ def self_test():
           "a digest is read and folded to lower case")
     check(stated_digest("ab" * 15 + "a") is None,
           "thirty-one hex digits is not a digest")
+    commit_id = "4b" * 20
+    check(stated_digest("commit " + commit_id) is None
+          and stated_digest("sha1 " + commit_id) == commit_id
+          and stated_digest("checksum " + commit_id.upper()) == commit_id
+          and stated_digest("commit " + commit_id + " md5 " + "cd" * 16)
+          == "cd" * 16,
+          "a 40 digit commit id is not a stated digest  <-- pinned defect")
     check(join_dir("/a/", "x") == "/a/x" and join_dir("C:\\d\\", "x") == "C:\\d\\x"
           and join_dir("rel", "x") == "rel/x",
           "a folder and a name join with the folder's own separator")
@@ -1677,6 +1879,9 @@ def self_test():
           "a relative path is read against --base with either separator")
     check(cls("./a.txt", "posix", "/base")[1] == os.path.join("/base", "a.txt"),
           "a leading dot segment is dropped")
+    check(cls("\\x", "posix", "/base")[0] == AMBIGUOUS
+          and cls("~/x", "posix", "/base")[0] == AMBIGUOUS,
+          "a rooted or home-relative path stays ambiguous under --base")
     check(apply_map("C:\\work\\a\\b.txt", []) is None,
           "no mappings maps nothing")
     check(cls("C:\\work\\a\\b.txt", "posix", None,
@@ -1801,6 +2006,64 @@ def self_test():
           "a table in UTF-8, UTF-8 with a BOM or UTF-16 is read as text"
           "  <-- pinned defect")
 
+    # ---- parity table: columns that are not copies, and labels that are not claims
+    notes_row = ("| a | `/d/a.md` | `/w/a.md` | **YES** | `/d/` - authority,"
+                 " see `/docs/INDEX.md`; do not edit B |\n")
+    entries, skipped = parse_table(
+        "| File | Copy A | Copy B | Identical? | Canonical |\n"
+        "|---|---|---|---|---|\n" + notes_row)
+    check(len(entries) == 1 and [i.text for i in entries[0].items]
+          == ["/d/a.md", "/w/a.md"],
+          "a Canonical column is not a copy, and its words are not the claim"
+          "  <-- pinned defect")
+    entries, _ = parse_table(
+        "| File | Copy A | Copy B | Identical? | Notes |\n|---|---|---|---|---|\n"
+        "| b | `/d/b.md` | `/w/b.md` | YES | do not edit B directly |\n")
+    check(len(entries) == 1,
+          "a Notes column that says 'not' does not hide the claim"
+          "  <-- pinned defect")
+    entries, _ = parse_table(
+        "| File | `/a/` | `/b/` | Identical? | Notes |\n|---|---|---|---|---|\n"
+        "| x.txt | 3 B | 3 B | yes | not touched since March |\n")
+    check(len(entries) == 1,
+          "a Notes column is ignored in the folder-per-column shape too")
+    entries, skipped = parse_table(
+        "| File | Copy A | Copy B | Identical? | Notes |\n|---|---|---|---|---|\n"
+        "\n| n | `/a/x` | `/b/x` | yes | do not touch |\n")
+    check(entries == [] and skipped[MIXED] == 1,
+          "a header's Notes column does not carry past the end of its table")
+    entries, _ = parse_table("| split | `/a/x` | `/b/x` | identical |\n")
+    check(len(entries) == 1,
+          "a first cell that names a script called split is a label"
+          "  <-- pinned defect")
+    entries, _ = parse_table("| yes | `/a/x` | `/b/x` |\n")
+    check(len(entries) == 1,
+          "a first cell that claims sameness is still a claim")
+    entries, _ = parse_table(
+        "| `/a/x` (commit " + commit_id + ") | `/b/x` | identical |\n")
+    check(len(entries) == 1 and entries[0].items[0].digest is None,
+          "a commit id beside a path is not a digest  <-- pinned defect")
+    entries, _ = parse_table("| File | `/a/` | `/b/` | Identical? |\n"
+                             "|---|---|---|---|\n| x.txt | 3 B | 3 B | yes")
+    check(len(entries) == 1,
+          "a last row with no newline after it is read")
+    entries, skipped = parse_table("| File | `/a/` | `/b/` | Identical? |\n"
+                                   "|---|---|---|---|\n| short.txt | 3 B |\n")
+    check(entries == [] and skipped[NO_CLAIM] == 1,
+          "a row with fewer cells than columns is counted, not a crash")
+    entries, _ = parse_table("| File | Verdict | `/a/` | `/b/` |\n"
+                             "|---|---|---|---|\n| x.txt | identical | 3 B | 3 B |\n")
+    check(len(entries) == 1,
+          "the claim may sit in any column after the first")
+    check(Item("https://u:tok_ABC123@h.example/x.py").text
+          == "https://***@h.example/x.py",
+          "a password inside a url a table names is masked  <-- pinned defect")
+    check("tok_ABC123" not in json.dumps(as_parity_report(
+        "t.md", "posix", {}, [judge(Entry(1, [
+            Item("https://u:tok_ABC123@h.example/x.py"), Item("/a/x")]),
+            "posix", None, [], fake)])),
+          "and the parity report does not carry it  <-- pinned defect")
+
     sized = Entry(1, [Item("/a/x", size=3), Item("/b/x", size=3)])
     check(verdict_of(sized).verdict == V_HELD, "a stated size that is right holds")
     stale = Entry(1, [Item("/a/x", size=99), Item("/b/x", size=3)])
@@ -1852,17 +2115,23 @@ def self_test():
           "a held finding ranks last")
 
     # ---- the filesystem and the command line, in a temporary tree
-    global READ_LIMIT
+    global READ_LIMIT, read_bytes
+    stderr_seen = [""]
 
     def run_main(argv):
-        """Call main with stdout captured. Returns (exit code, output)."""
+        """Call main with both streams captured. Returns (exit code, stdout).
+
+        What went to stderr is left in stderr_seen[0].
+        """
         buffer = io.StringIO()
-        keep = sys.stdout
-        sys.stdout = buffer
+        errors = io.StringIO()
+        keep, keep_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = buffer, errors
         try:
             code = main(argv)
         finally:
-            sys.stdout = keep
+            sys.stdout, sys.stderr = keep, keep_err
+        stderr_seen[0] = errors.getvalue()
         return code, buffer.getvalue()
 
     def write(path, data):
@@ -1913,7 +2182,7 @@ def self_test():
         # Written inside __pycache__ on purpose: the walk never descends
         # there, so these two prove the identity rule without disturbing any
         # count asserted above. One comment, two encodings of it. The bytes
-        # differ, the decoded text does not, and the 381-distinct-contents
+        # differ, the decoded text does not, and the distinct-contents
         # figure this tool reports depends on which of the two it hashes.
         twin_a = os.path.join(tree, "__pycache__", "twin_utf8.py")
         twin_b = os.path.join(tree, "__pycache__", "twin_latin.py")
@@ -1943,6 +2212,9 @@ def self_test():
         code, text = run_main([os.path.join(tree, "scheduled")])
         check(code == 0, "a folder with no repeated name exits 0")
         check("CLEAN" in text, "and the run says CLEAN")
+        check("could not be tokenized" not in text
+              and "Check only" not in text and "wrote" not in text,
+              "and it names no unreadable file and no report it did not write")
         check("no group at or above" in text,
               "and explains that nothing met --min-class")
 
@@ -1978,7 +2250,8 @@ def self_test():
             READ_LIMIT = keep_limit
 
         code, _ = run_main([os.path.join(tree, "nowhere")])
-        check(code == 2, "a path that does not exist exits 2")
+        check(code == 2 and "no such path" in stderr_seen[0],
+              "a path that does not exist exits 2 and says so")
         code, _ = run_main([tree, "--ext", ".zzz"])
         check(code == 2, "a scan that reads nothing exits 2")
         code, _ = run_main([])
@@ -2087,15 +2360,21 @@ def self_test():
 
         part_table = table([((a_same, b_same, foreign), "identical")])
         code, text = run_main(["--parity", part_table])
-        check(code == 0 and "PARTIAL" in text,
-              "two matching copies and a foreign one is partial and exits 0")
+        check(code == 3 and "PARTIAL" in text and "INCOMPLETE" in text
+              and "CLEAN" not in text,
+              "two matching copies and a foreign one is partial, and the run"
+              " is INCOMPLETE and exits 3  <-- pinned defect")
         code, text = run_main(["--parity", part_table, "--strict"])
         check(code == 1, "--strict exits 1 on a partial row")
 
         foreign_table = table([((foreign, a_same), "identical")])
         code, text = run_main(["--parity", foreign_table])
-        check("unverifiable=1" in text and code == 0,
-              "a foreign path is unverifiable, not missing, and exits 0")
+        check("1 row(s) that claim identical copies were not fully compared"
+              " (unverifiable 1, partial 0, said both 0)" in text,
+              "the INCOMPLETE line counts each reason for the rows it left open")
+        check("unverifiable=1" in text and code == 3 and "CLEAN" not in text,
+              "a table nothing in could be verified is INCOMPLETE and exits 3,"
+              " never CLEAN  <-- pinned defect")
         code, text = run_main(["--parity", foreign_table, "--strict"])
         check(code == 1, "--strict exits 1 on an unverifiable row")
         code, text = run_main(["--parity", foreign_table, "--map",
@@ -2143,7 +2422,7 @@ def self_test():
         twice_table = table([((a_same, os.path.join(
             tree, "copy_a", "..", "copy_a", "same.txt")), "identical")])
         code, text = run_main(["--parity", twice_table])
-        check(code == 0 and "unverifiable=1" in text and "same file" in text
+        check(code == 3 and "unverifiable=1" in text and "same file" in text
               and "held=0" in text,
               "a row naming one file twice is not held  <-- pinned defect")
         dir_table = table([((a_same, os.path.join(tree, "copy_b")),
@@ -2157,7 +2436,8 @@ def self_test():
         code, _ = run_main(["--parity", empty_path])
         check(code == 2, "a table with no claim of identical exits 2")
         code, _ = run_main(["--parity", os.path.join(tree, "nowhere.md")])
-        check(code == 2, "a table that does not exist exits 2")
+        check(code == 2 and "no such table" in stderr_seen[0],
+              "a table that does not exist exits 2 and says so")
         code, _ = run_main(["--parity", ok_table, "--base", a_same])
         check(code == 2, "a --base that is not a folder exits 2")
         keep_limit = READ_LIMIT
@@ -2177,6 +2457,217 @@ def self_test():
         check(code == 64, "--map without --parity is a usage error")
     finally:
         shutil.rmtree(tree)
+
+    # ---- a second tree: runs that must not end CLEAN, and crashes that are now exits
+    tree2 = tempfile.mkdtemp(prefix="clonedrift-selftest-")
+    try:
+        def put(rel, text):
+            path = os.path.join(tree2, *rel.split("/"))
+            if not os.path.isdir(os.path.dirname(path)):
+                os.makedirs(os.path.dirname(path))
+            write(path, text.encode("utf-8"))
+            return path
+
+        def at2(name):
+            return os.path.join(tree2, name)
+
+        def slurp(path):
+            handle = open(path)
+            try:
+                return handle.read()
+            finally:
+                handle.close()
+
+        put("ok/a/a.py", "x = 1\n")
+        put("ok/b/b.py", "y = 2\n")
+        code, text = run_main([at2("ok")])
+        check(code == 0 and "CLEAN" in text and "INCOMPLETE" not in text,
+              "a scan that compared everything and found nothing is CLEAN")
+
+        put("unread/a/m.py", "msg = 'one\n")
+        put("unread/b/m.py", "msg = 'two\n")
+        code, text = run_main([at2("unread")])
+        check(code == 3 and "INCOMPLETE" in text and "CLEAN" not in text
+              and "0 skipped, 2 could not be tokenized" in text,
+              "a name whose copies could not be read is INCOMPLETE and exits 3,"
+              " never CLEAN  <-- pinned defect")
+        code, text = run_main([at2("unread"), "--fail-on", "code"])
+        check(code == 1 and "FAIL" in text and "INCOMPLETE" not in text,
+              "a finding still outranks an incomplete run")
+
+        put("big/a/k.py", "x = 1\n")
+        put("big/b/k.py", "x = 2\n")
+        put("big/a/long.py", "x = 3  # " + "p" * 30 + "\n")
+        put("big/a/m.py", "msg = 'one\n")
+        put("big/b/m.py", "msg = 'two\n")
+        keep_limit = READ_LIMIT
+        READ_LIMIT = 20
+        try:
+            code, text = run_main([at2("big")])
+        finally:
+            READ_LIMIT = keep_limit
+        check(code == 3 and "skipped" in text and "INCOMPLETE" in text
+              and "CLEAN" not in text and "3 file(s) or folder(s) were not compared (1 skipped, 2 could not"
+              in text,
+              "a copy skipped as too large makes the run INCOMPLETE, never"
+              " CLEAN  <-- pinned defect")
+
+        put("deny/a/job.py", "x = 1\n")
+        put("deny/locked/job.py", "x = 2\n")
+        real_scandir = os.scandir
+
+        def deny(path="."):
+            if os.path.basename(str(path)) == "locked":
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_scandir(path)
+
+        os.scandir = deny
+        try:
+            code, text = run_main([at2("deny")])
+        finally:
+            os.scandir = real_scandir
+        check(code == 3 and "skipped" in text and "locked" in text
+              and "CLEAN" not in text,
+              "a folder that cannot be listed is named and the run is"
+              " INCOMPLETE  <-- pinned defect")
+        problems = []
+        check(walk_sources(at2("nowhere"), [".py"], problems) == []
+              and len(problems) == 1,
+              "the walk reports a folder it could not list instead of"
+              " dropping it")
+
+        target = os.path.join(at2("nodir"), "r.json")
+        code, text = run_main([at2("ok"), "--out", target, "--apply"])
+        check(code == 2 and "could not write" in stderr_seen[0]
+              and "wrote" not in text,
+              "an --out folder that does not exist exits 2 with a message,"
+              " not a traceback  <-- pinned defect")
+        code, text = run_main([at2("ok"), "--apply"])
+        check(code == 0 and "wrote" not in text and "Check only" not in text,
+              "--apply with no --out writes and says nothing")
+
+        pa = put("par/a/same.txt", "one\n")
+        pb = put("par/b/same.txt", "one\n")
+        pc = put("par/c/same.txt", "ONE\n")
+        both = put("par/held.md", "| `%s` | `%s` | identical |\n" % (pa, pb))
+        code, text = run_main(["--parity", both])
+        check(code == 0 and "CLEAN" in text,
+              "a table whose rows all hold is CLEAN")
+        code, text = run_main(["--parity", both, "--out", target, "--apply"])
+        check(code == 2 and "could not write" in stderr_seen[0],
+              "a parity --out that cannot be written exits 2"
+              "  <-- pinned defect")
+        real_read = read_bytes
+
+        def refuse(path):
+            raise PermissionError(13, "Permission denied", path)
+
+        read_bytes = refuse
+        try:
+            code, text = run_main(["--parity", both])
+        finally:
+            read_bytes = real_read
+        check(code == 2 and "Permission denied" in stderr_seen[0],
+              "a parity table that cannot be read exits 2, not 1"
+              "  <-- pinned defect")
+
+        said_both = put("par/both.md", "| `%s` | `%s` | identical |\n"
+                        "| `%s` | `%s` | yes, but do not edit B |\n"
+                        % (pa, pb, pa, pc))
+        code, text = run_main(["--parity", said_both])
+        check(code == 3 and "INCOMPLETE" in text and "said both 1" in text
+              and "CLEAN" not in text,
+              "a row that claims sameness and says both is never CLEAN"
+              "  <-- pinned defect")
+        noted = put("par/noted.md",
+                    "| File | Copy A | Copy B | Identical? | Notes |\n"
+                    "|---|---|---|---|---|\n"
+                    "| s | `%s` | `%s` | **YES** | do not edit B directly |\n"
+                    % (pa, pc))
+        code, text = run_main(["--parity", noted, "--strict"])
+        check(code == 1 and "FALSE" in text,
+              "a YES row with a Notes column is judged, and false"
+              "  <-- pinned defect")
+        secret = put("par/secret.md",
+                     "| `https://u:tok_ABC123@h.example/x.py` | `%s` |"
+                     " identical |\n" % pa)
+        report = at2("secret.json")
+        code, text = run_main(["--parity", secret, "--out", report, "--apply"])
+        check("tok_ABC123" not in text and "tok_ABC123" not in slurp(report)
+              and "***@" in slurp(report),
+              "a password in a url a table names reaches neither the screen nor"
+              " the report  <-- pinned defect")
+
+        put("cred/a/etl.py", "FEED = 'ftp://svc:Hunter2pw@h.example/in'\n")
+        put("cred/b/etl.py", "FEED = 'ftp://svc:Zebra99pw@h.example/in'\n")
+        report = at2("cred.json")
+        code, text = run_main([at2("cred"), "--min-class", "cosmetic",
+                               "--show-diff", "--out", report, "--apply"])
+        check("Hunter2pw" not in text + slurp(report)
+              and "Zebra99pw" not in text + slurp(report)
+              and "ftp://***@h.example/in" in text,
+              "a password in a script reaches neither the screen nor the"
+              " report  <-- pinned defect")
+
+        put("del/a/clean.py", "import arcpy\narcpy.management.Delete(fc)\n")
+        put("del/b/clean.py", "import arcpy\n")
+        code, text = run_main([at2("del")])
+        check(code == 1 and "DESTRUCTIVE" in text,
+              "arcpy.management.Delete in one copy only exits 1"
+              "  <-- pinned defect")
+        put("wrap/a/j.py", "import shutil\nshutil.rmtree('x')\n")
+        put("wrap/b/j.py", "import shutil\n'''\nshutil.rmtree('x')\n'''\n")
+        code, text = run_main([at2("wrap")])
+        check(code == 1 and "live in one copy only" in text,
+              "a call switched off by a triple-quoted block exits 1"
+              "  <-- pinned defect")
+        put("bom/a/j.py", "x = 1\n")
+        write(put("bom/b/j.py", ""), b"\xef\xbb\xbfx = 1\n")
+        code, text = run_main([at2("bom"), "--min-class", "cosmetic"])
+        check("COSMETIC" in text and "1 version)" in text,
+              "a copy saved with a byte-order mark is the same version"
+              "  <-- pinned defect")
+
+        put("arrow/a/j.py",
+            u"import shutil\nshutil.rmtree('x')  # \u2192 clean\n")
+        put("arrow/b/j.py",
+            u"import shutil\n# shutil.rmtree('x')  # \u2192 clean\n")
+        narrow = io.TextIOWrapper(io.BytesIO(), encoding="cp1252",
+                                  errors="strict", write_through=True)
+        keep = sys.stdout
+        sys.stdout = narrow
+        try:
+            code = main([at2("arrow"), "--show-diff"])
+        finally:
+            sys.stdout = keep
+        check(code == 1 and b"\\u2192" in narrow.buffer.getvalue(),
+              "a character the output encoding lacks is written as an escape,"
+              " not a traceback that exits 1  <-- pinned defect")
+        asked = []
+
+        class Reconfigurable(object):
+            def reconfigure(self, **kwargs):
+                asked.append(kwargs)
+
+        _escape_unencodable([Reconfigurable(), io.StringIO()])
+        check(asked == [{"errors": "backslashreplace"}],
+              "only a stream that can be reconfigured is reconfigured")
+
+        put("cls/a/m.py", "x = 1\n")
+        put("cls/b/m.py", "x = 2\n")
+        code, text = run_main([at2("cls")])
+        check(code == 0 and "CODE " in text,
+              "--min-class code shows a code group")
+        code, text = run_main([at2("cls"), "--min-class", "path"])
+        check("no group at or above --min-class path" in text,
+              "--min-class path hides a code group")
+        for near in ("0", "1", "0.0"):
+            code, _ = run_main([at2("cls"), "--near", near])
+            check(code != 64, "--near %s is inside the allowed range" % near)
+        code, _ = run_main([at2("cls"), "--near=-0.1"])
+        check(code == 64, "a --near below 0 is a usage error")
+    finally:
+        shutil.rmtree(tree2)
 
     # ---- argument handling
     args = _parse(["tree"])
@@ -2283,6 +2774,43 @@ def _map_arg(text):
     return prefix, folder
 
 
+def _escape_unencodable(streams):
+    """Stop print() from crashing on a character the output encoding lacks.
+
+    A Windows console redirected to a file writes cp1252, and a source line
+    with an arrow in a comment is enough to raise UnicodeEncodeError, whose
+    traceback exits 1: the code for "drift found". The character is written as
+    a backslash escape instead. A stream with no reconfigure (StringIO) is left
+    alone.
+    """
+    for stream in streams:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="backslashreplace")
+
+
+def write_report(args, report):
+    """The --out step both modes share. 0 when done, 2 when the write failed."""
+    if not args.out:
+        return 0
+    if not args.apply:
+        print("Check only. %s was not written. Re-run with --apply."
+              % args.out)
+        return 0
+    try:
+        handle = open(args.out, "w")
+        try:
+            json.dump(report, handle, indent=2, sort_keys=True)
+        finally:
+            handle.close()
+    except OSError as exc:
+        print("error: could not write %s: %s. Check that the folder exists "
+              "and can be written." % (args.out, exc), file=sys.stderr)
+        return 2
+    print("wrote %s" % args.out)
+    return 0
+
+
 def run_parity(args):
     """The --parity mode. Reads a table and the files it names, writes nothing."""
     if args.path:
@@ -2298,7 +2826,7 @@ def run_parity(args):
         return 2
     try:
         text = decode_table(read_bytes(args.parity))
-    except Unreadable as exc:
+    except (Unreadable, OSError) as exc:
         print("error: %s: %s" % (args.parity, exc), file=sys.stderr)
         return 2
 
@@ -2326,30 +2854,30 @@ def run_parity(args):
                 print(line)
             print("")
 
-    if args.out:
-        if args.apply:
-            handle = open(args.out, "w")
-            try:
-                json.dump(as_parity_report(args.parity, host, skipped,
-                                           findings),
-                          handle, indent=2, sort_keys=True)
-            finally:
-                handle.close()
-            print("wrote %s" % args.out)
-        else:
-            print("Check only. %s was not written. Re-run with --apply."
-                  % args.out)
+    code = write_report(args, as_parity_report(args.parity, host, skipped,
+                                               findings))
+    if code:
+        return code
 
     bad = parity_failing(findings, args.strict)
     if bad:
         print("FAIL: %d row(s) claim identical copies that the files do not "
               "bear out." % len(bad))
         return 1
-    print("CLEAN: no row's claim is contradicted.")
+    unproven = counts[V_UNVERIFIABLE] + counts[V_PARTIAL] + skipped[MIXED]
+    if unproven:
+        print("INCOMPLETE: no row's claim is contradicted, but %d row(s) that "
+              "claim identical copies were not fully compared (unverifiable "
+              "%d, partial %d, said both %d)."
+              % (unproven, counts[V_UNVERIFIABLE], counts[V_PARTIAL],
+                 skipped[MIXED]))
+        return 3
+    print("CLEAN: every row's claim was compared and holds.")
     return 0
 
 
 def main(argv=None):
+    _escape_unencodable((sys.stdout, sys.stderr))
     args = _parse(sys.argv[1:] if argv is None else argv)
 
     if args.self_test:
@@ -2374,7 +2902,7 @@ def main(argv=None):
 
     sources = []
     skipped = []
-    for path in walk_sources(args.path, args.ext):
+    for path in walk_sources(args.path, args.ext, skipped):
         try:
             sources.append(load(path))
         except (Unreadable, IOError, OSError) as exc:
@@ -2421,24 +2949,22 @@ def main(argv=None):
             print("        %s" % right.path)
         print("")
 
-    if args.out:
-        if args.apply:
-            handle = open(args.out, "w")
-            try:
-                json.dump(as_report(counts, groups, pairs), handle, indent=2,
-                          sort_keys=True)
-            finally:
-                handle.close()
-            print("wrote %s" % args.out)
-        else:
-            print("Check only. %s was not written. Re-run with --apply."
-                  % args.out)
+    code = write_report(args, as_report(counts, groups, pairs))
+    if code:
+        return code
 
     bad = failing(groups, args.fail_on)
     if bad:
         print("FAIL: %d name(s) at or above --fail-on %s."
               % (len(bad), args.fail_on))
         return 1
+    unread = counts["unreadable"] + len(skipped)
+    if unread:
+        print("INCOMPLETE: no name at or above --fail-on %s, but %d file(s) "
+              "or folder(s) were not compared (%d skipped, %d could not be "
+              "tokenized)." % (args.fail_on, unread, len(skipped),
+                               counts["unreadable"]))
+        return 3
     print("CLEAN: no name at or above --fail-on %s." % args.fail_on)
     return 0
 

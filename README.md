@@ -9,10 +9,12 @@ A nightly job pulls a parcel roll off a vendor host, empties the production feat
 appends what it got. Somebody finds the bug, fixes it, tests it, and goes home. Nothing changes at
 2am, because Task Scheduler runs a different copy.
 
-On one real share, this tool found fifteen copies of that job under a single name, holding four
-versions. Two of those versions differ by one edit and one stray space. One runs `os.remove` and
-`shutil.rmtree` on the staging folder when the load finishes. The other has those two lines, and
-the message that announces them, commented out. Run the wrong copy and the extract is gone.
+Picture a share with a dozen copies of that job under one name, holding three versions. Two of
+those versions differ by one edit and one stray space. One runs `os.remove` and `shutil.rmtree` on
+the staging folder when the load finishes. The other has those two lines, and the message that
+announces them, commented out. Run the wrong copy and the extract is gone. The share in this
+story is invented. The shape is the one a real legacy share showed, and that share is not
+published.
 
 A byte-for-byte deduplicator sees none of this, because the copies are not identical. Nobody on
 the team can say from memory which copy the scheduler runs. Opened on its own, every copy looks
@@ -70,6 +72,12 @@ PASS  TruncateTable matches despite the _management suffix  <-- pinned defect
 ...
 PASS  a destructive call whose target changed is drift
 ...
+PASS  a comment edit beside a destructive call is not drift  <-- pinned defect
+...
+PASS  a call wrapped in a triple-quoted block is drift, and is named  <-- pinned defect
+...
+PASS  a UTF-8 byte-order mark does not make a second version  <-- pinned defect
+...
 PASS  a host disagreement outranks a print message  <-- pinned defect
 ...
 PASS  a path literal both versions share is not evidence  <-- pinned defect
@@ -94,7 +102,15 @@ PASS  three copies of one content report two content pairs, not five  <-- pinned
 ...
 PASS  a claim that rests on size alone is still a claim of identical
 ...
+PASS  'match' reads as same  <-- pinned defect
+...
+PASS  'isn't identical' is not a claim of identical  <-- pinned defect
+...
+PASS  'identical, no drift' is a claim of identical  <-- pinned defect
+...
 PASS  a span with only a drive colon and a BEL is still a path  <-- pinned defect
+...
+PASS  a 40 digit commit id is not a stated digest  <-- pinned defect
 ...
 PASS  a header's folders do not leak into the table after it  <-- pinned defect
 ...
@@ -122,6 +138,7 @@ PASS  one local copy and one foreign is unverifiable, not missing  <-- pinned de
 PASS  one file named twice is not two copies  <-- pinned defect
 ...
 PASS  a table in UTF-8, UTF-8 with a BOM or UTF-16 is read as text  <-- pinned defect
+PASS  a Canonical column is not a copy, and its words are not the claim  <-- pinned defect
 ...
 PASS  bytes that are not UTF-8 fall back to latin-1  <-- pinned defect
 ...
@@ -148,20 +165,37 @@ PASS  a table saved with a UTF-8 BOM is read like any other  <-- pinned defect
 PASS  a table saved with UTF-16 is read like any other  <-- pinned defect
 PASS  a row naming one file twice is not held  <-- pinned defect
 ...
+PASS  a name whose copies could not be read is INCOMPLETE and exits 3, never CLEAN  <-- pinned defect
+...
+PASS  a folder that cannot be listed is named and the run is INCOMPLETE  <-- pinned defect
+...
+PASS  a parity --out that cannot be written exits 2  <-- pinned defect
+...
+PASS  a row that claims sameness and says both is never CLEAN  <-- pinned defect
+...
+PASS  a password in a script reaches neither the screen nor the report  <-- pinned defect
+PASS  arcpy.management.Delete in one copy only exits 1  <-- pinned defect
+...
+PASS  a character the output encoding lacks is written as an escape, not a traceback that exits 1  <-- pinned defect
+...
 PASS  a unique prefix of --parity is refused by the parser  <-- pinned defect
 PASS  a shorter prefix of --apply is refused by the parser  <-- pinned defect
 ...
 PASS  an unknown --min-class is rejected
 PASS  a unique prefix of --apply is refused by the parser  <-- pinned defect
+...
 ----------------------------------------------------------------------
-339 assertions, 0 failed
+423 assertions, 0 failed
 ```
+
+That block is copied from a real run. Lines marked `...` were left out to keep it short; every
+line shown appears in the full output, in this order.
 
 ## Requirements
 
-Python 3.9 or later. Standard library only: `argparse`, `difflib`, `hashlib`, `io`, `json`, `os`,
-`re`, `stat`, `sys` and `tokenize`, with `shutil` and `tempfile` for the self-test's own temporary
-tree.
+Python 3.9 or later. Standard library only: `argparse`, `collections`, `difflib`, `hashlib`, `io`,
+`json`, `os`, `re`, `stat`, `sys` and `tokenize`, with `shutil` and `tempfile` for the self-test's
+own temporary trees.
 No `arcpy`, no `git`, no network and no credentials. It runs the same on ArcGIS Pro's Python and
 on a plain `python3`.
 
@@ -170,17 +204,17 @@ git clone https://github.com/uhsear/clonedrift.git
 python clonedrift.py --self-test
 ```
 
-The self-test was run on Windows with Python 3.13, 3.12, 3.10 and 3.9, and on Linux with Python
-3.12. All five report 339 assertions and 0 failed. The count is equal on every host because no
+The self-test was run on Windows with Python 3.13, 3.12, 3.11, 3.10 and 3.9, and on Linux with
+Python 3.12. All six report 423 assertions and 0 failed. The count is equal on every host because no
 assertion branches on the operating system: the path-class tests pass the host in as an argument,
 and the filesystem tests build their paths with `os.path.join`.
 
-Branch coverage of `clonedrift.py` is 100 percent (1274 statements, 312 branches), measured on
+Branch coverage of `clonedrift.py` is 100 percent (1528 statements, 356 branches), measured on
 Windows with `coverage run --branch clonedrift.py --self-test`. One line is excluded by a
 `# pragma: no cover` comment: the `if __name__ == "__main__"` guard, because the self-test calls
 `main()` directly and never starts the file as a script. `coverage` is not installed on the Linux
-host, so coverage was not measured there. `pyflakes` is clean, and `python -W error` compiles the
-file on Windows and on Linux.
+host, so coverage was not measured there. `pyflakes` is clean on Windows and is not installed on
+the Linux host. `python -W error` compiles the file on both.
 
 ## Usage
 
@@ -282,9 +316,16 @@ The input is a Markdown table. Two shapes are read.
 In the first, each row names its copies in backticks. In the second, the header names one folder
 per column, and each row's first cell is a file name that is joined to each folder. A row is
 checked when its words claim the copies are the same (`identical`, `in parity`, `byte-for-byte`,
-`same`, `match`, `yes`) and say nothing against it. A row that says they differ, or says both, is
-counted and left alone. A byte count (`33,782 B`) or a hex digest of 32, 40 or 64 digits that
-sits in the same cell as a path is checked against the file too.
+`same`, `match`, `yes`) and say nothing against it. `no drift` and `no issues` are good news, not a
+denial. `not identical`, `isn't the same`, `non-identical` and `never the same` deny the claim. A
+row that says they differ, or says both, is counted and not judged. A byte count (`33,782 B`) or a
+hex digest of 32, 40 or 64 digits that sits in the same cell as a path is checked against the file
+too. A 40 digit string counts only if the cell also says `sha1`, `hash`, `digest` or `checksum`,
+because a git commit id has 40 digits as well.
+
+The words of a column headed `Canonical`, `Authority`, `Notes`, `Comments` or `Remarks` are not part
+of the claim, and a path in that column is not a copy. A first cell that names no path is the row's
+label, so a script called `split` does not read as a denial.
 
 A real run, on Linux with Python 3.12, over a synthetic share. The table names eight rows that claim
 identical copies. The BEL byte in the fourth is really in the file. The table is saved as UTF-8,
@@ -329,7 +370,8 @@ FAIL: 3 row(s) claim identical copies that the files do not bear out.
 ```
 
 Paths are printed escaped, so a control byte shows as `\x07` and the report stays plain ASCII. The
-share and the table are invented for this README. The four `UNVERIFIABLE` rows exit 0 by default.
+share and the table are invented for this README. Without the three
+failing rows, the four `UNVERIFIABLE` rows would end `INCOMPLETE` with exit 3, never `CLEAN`.
 `--strict` turns them, and any `PARTIAL` row, into exit 1: the same table gives `FAIL: 7 row(s)`.
 `--map "C:\shared\gis=deployed"` makes the first of them checkable, and that row then holds
 (`unverifiable=3`, `held=2`).
@@ -364,8 +406,12 @@ From worst to best: `FALSE` (bytes differ), `MISSING` (a named copy cannot be op
 `STALE` (a size or digest stated in the table is not what the file is now), `UNVERIFIABLE`,
 `PARTIAL`, `HELD`. A row with several problems takes the worst and lists all of them. Exit 1 on
 `FALSE`, `MISSING`, `CORRUPT` or `STALE`; with `--strict`, also on `UNVERIFIABLE` and `PARTIAL`.
-Exit 2 if the table is missing, over the read limit or holds no row that claims identical copies,
-or if `--base` is not a folder.
+With no failing row, the run ends `CLEAN` (exit 0) only if every row that claims sameness was
+compared and holds. If any such row is `UNVERIFIABLE`, `PARTIAL`, or was not judged because it
+says both, the run ends `INCOMPLETE` with exit 3. A table whose every row could not be checked
+therefore never reads as clean. Exit 2 if the table is missing, cannot be read, is over the read
+limit or holds no row that claims identical copies, if `--base` is not a folder, or if `--out`
+cannot be written.
 
 A copy that is a folder, a device or a pipe is `MISSING` with the note "not a regular file". It is
 never opened. A path named twice in one row counts once, whether it is spelled `a/x` and `a/./x`
@@ -379,12 +425,21 @@ copy of itself. Two hard links to one file are not caught (see Limits).
   dropped. A copy that somebody reformatted is therefore the same version, and a copy that
   somebody edited is not. Two copies with different bytes and the same token stream are reported
   as one version.
-- **Whether the versions disagree about a destructive call.** The raw lines of every pair of
-  versions are diffed. A differing line that calls `rmtree`, `os.remove`, `os.unlink`,
-  `Delete_management`, `DeleteFeatures`, `DeleteRows` or `TruncateTable` makes the group
-  DESTRUCTIVE. Raw lines are used rather than tokens because the case that matters is a line one
-  copy runs and the other has commented out. A token stream has already discarded the commented
-  copy. The evidence marks which side is commented.
+- **Whether the versions disagree about a destructive call.** Each version's live statements that
+  call `rmtree`, `os.remove`, `os.rmdir`, `unlink(`, `Delete(`, `Delete_management`,
+  `DeleteField`, `DeleteFeatures`, `DeleteRows`, `deleteRow` or `TruncateTable` are counted, and
+  two versions that count differently make the group DESTRUCTIVE. A statement is live when the
+  call is code: not in a comment and not inside a string. A comment edit or a re-indent beside
+  the call is therefore not a disagreement, and a call wrapped in a triple-quoted block, the way
+  legacy scripts switch a line off without editing it, is one. The evidence is read from the raw
+  lines, because the case that matters is a line one copy runs and the other has commented out,
+  and a token stream has already discarded the commented copy. It marks which side is commented.
+  `arcpy.management.Delete(in_data, {data_type})` is the current spelling of the Delete tool, and
+  Esri says it "permanently deletes data"
+  (https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/delete.html).
+- **No password in a report.** A url in a literal or a source line is printed with its
+  `user:password@` replaced by `***@`, on screen, in `--show-diff` and in the `--out` file. A
+  legacy script often holds `ftp://user:password@host/` in plain text.
 - **Whether the versions name different hosts or paths.** Each version's string literals are
   collected, filtered to the ones that name a machine or a place on one, and compared. Docstrings
   are excluded. Quote style is ignored, so a reformatted file is not reported as a host change.
@@ -396,12 +451,12 @@ copy of itself. Two hard links to one file are not caught (see Limits).
   either: a copy with no token stream has no literals, and reporting every literal in its sibling
   as a disagreement would invent a finding rather than measure one. Such a group is CODE.
 - **Python 2.** The tokenizer, not `ast`, does the reading. A legacy ArcGIS share is mostly Python
-  2, which `ast.parse` rejects outright. On the 743-file share this was built against, `ast.parse`
-  rejects 340 files and the tokenizer reads 738.
+  2, which `ast.parse` rejects outright. On the legacy share this was built
+  against, `ast.parse` rejected about half of the files and the tokenizer read nearly all of them.
 - **The same verdict on every interpreter.** Python 3.10 and later raise on an unterminated string.
-  Python 3.9, which ArcGIS Pro 3.0 to 3.2 ship, returns a token stream with an error token in it
-  and no exception. The tool reads that stream and calls the file unreadable either way. The same
-  five files on that share are unreadable under Python 3.9 and under Python 3.13.
+  Python 3.9, the oldest interpreter supported here, returns a token stream with an error token in
+  it and no exception. The tool reads that stream and calls the file unreadable either way. The
+  same files on that share were unreadable under Python 3.9 and under Python 3.13.
 - **Renames, with `--near`.** Files whose names differ are compared by the Jaccard similarity of
   their five-token shingle sets. This is the case basename grouping cannot see: the copy somebody
   saved as `roadsync_old.py`.
@@ -411,7 +466,11 @@ copy of itself. Two hard links to one file are not caught (see Limits).
   equal size and different bytes are called out as such. See "Checking a parity table".
 - **A table saved by Windows PowerShell.** A UTF-8 byte-order mark in front of the header would
   hide it from the parser, and `>` writes UTF-16. The table is read as UTF-8 with or without a mark,
-  or as UTF-16 when it opens with a UTF-16 mark.
+  or as UTF-16 when it opens with a UTF-16 mark. A script saved with a UTF-8 mark is the same
+  version as the copy saved without one.
+- **A run that could not compare everything is never clean.** A copy over the read limit, a copy
+  the tokenizer refuses, a folder that cannot be listed and a table row that could not be verified
+  each end the run `INCOMPLETE` with exit 3 instead of `CLEAN`. A finding still exits 1.
 - **Why a path is not checkable.** Foreign, ambiguous and corrupt are separate classes, each with a
   reason, so a table written on another kind of host does not fill the report with false
   "missing" rows. The class rules rest on these sources:
@@ -445,35 +504,37 @@ copy of itself. Two hard links to one file are not caught (see Limits).
 
 ## Exit codes
 
-0 no group at or above `--fail-on`, 1 at least one group at or above it, 2 the path does not exist
-or nothing could be scanned, 64 usage error. A flag value argparse itself rejects, such as a
+0 no group at or above `--fail-on` and everything was compared, 1 at least one group at or above
+it, 2 the path does not exist, nothing could be scanned, or `--out` could not be written, 3 no
+finding but a copy, a folder or a table row could not be checked (the last line says `INCOMPLETE`),
+64 usage error. A flag value argparse itself rejects, such as a
 `--near` that is not a number or an unknown `--min-class`, is argparse's own error and exits 2.
 With `--parity`, the codes are those in "Verdicts" above, and passing both a path and `--parity`,
 or `--base`, `--map` or `--strict` without `--parity`, is a usage error that exits 64.
 
 ## What it measured
 
-One run of this tool over a 743-file legacy ArcGIS automation share reports 381 distinct contents.
-512 of those files sit in a group of byte-identical copies, and the largest group holds ten. 48
-filenames carry two or more different contents, across 289 files.
+The tool was built against a private legacy ArcGIS automation share of a few hundred scripts. The
+figures are rounded and the share is not published, so none of this can be reproduced from the repo.
+About two thirds of the files were byte-identical copies of another file. Among the names that
+carried several different contents, roughly one in five disagreed about a destructive call, more
+than half named different hosts or paths, and a handful could not be tokenized. A scan took a few
+seconds.
 
-Of those 48 names, 9 disagree about a destructive call and 27 name different hosts or paths. 9
-disagree about other code. 3 differ only in comments or whitespace. Five files could not be
-tokenized. The scan takes about four seconds.
-
-Those numbers are the argument for the tool. More than two thirds of that share is byte-identical
-copies. A deduplicator answers none of the questions that matter about the rest.
+Those proportions are the argument for the tool. A deduplicator answers none of the questions that
+matter about the files that are not identical copies.
 
 ## Why not jscpd or copydetect
 
-Both are good, both are maintained, and both read Python 2 without complaint. They will tell you
-what fraction of the share is duplicated, down to the matching token ranges. That is a real
-measurement and it is not the one an operator needs at 2am.
+Both are clone detectors, and they answer "how much of this tree is duplicated", down to the
+matching token ranges. That is a real measurement and it is not the one an operator needs at 2am. I
+have not run either against this tool's fixtures, so this comparison rests on what they document,
+not on a benchmark.
 
 This is not a new clone detector and does not try to be one. It asks a different question:
-**which of these fifteen copies has `rmtree` live, and which host does each one name.** Neither
-of those tools groups whole files by name, collapses the copies that differ only in formatting,
-and ranks the survivors by whether the disagreement touches a destructive call. That ranking is
+**which of these copies has `rmtree` live, and which host does each one name.** Neither
+of those tools documents grouping whole files by name, collapsing the copies that differ only in
+formatting, or ranking the survivors by whether the disagreement touches a destructive call. That ranking is
 the product. The clone detection underneath it is deliberately simple.
 
 It is also not a linter. `ruff` and `pylint` read one file at a time and have no concept of a
@@ -483,11 +544,14 @@ For `--parity`, the plain answer to "are these two files the same" already exist
 `sha256sum -c`, `diff -rq`, `fc /b` and Python's `filecmp` all compare bytes, and any of them is
 the right tool when you already have the list of pairs. They do not read the pairs out of a table,
 they do not notice the claim was made from sizes, and they report a Windows path on a Linux host
-as an error. A GitHub search for `docdrift` on 2026-10-23 returned eight public repositories. By
-their descriptions alone, one checks the paths, links and repositories cited in Markdown against
-the real tree, and one keeps project documentation in step with code through a language model. I
-read the descriptions, not the code. Both ask whether the documentation still matches the project.
-This asks whether two copies that the table says are the same still hold the same bytes.
+as an error. `gh search repos docdrift --limit 100` on 2026-10-30 returned 56 public repositories, and
+`gh search repos clonedrift` returned only this one. By their descriptions alone, several check the
+paths, links or symbols that a Markdown document cites against the real tree, for example
+`neshboy/docdrift` (a CI gate for stale file-path, link and symbol references) and
+`assaads/docdrift` (a manifest-driven gate that fails CI when docs drift from code). Others keep
+documentation in step with code through a language model. I read the descriptions, not the code,
+and did not run any of them. They ask whether documentation still matches a project. This asks
+whether two copies that a table says are the same still hold the same bytes.
 
 ## Limits
 
@@ -497,8 +561,9 @@ This asks whether two copies that the table says are the same still hold the sam
   named scripts are invisible to the grouping. `--near` covers part of that gap, but it is a
   whole-file score as well.
 - The destructive call list is a fixed regular expression in the CONFIGURATION block. It covers
-  the `shutil`, `os` and `arcpy` calls that empty things. A destructive call reached through a
-  variable, a wrapper function or `getattr` is not matched.
+  the `shutil`, `os`, `pathlib` and `arcpy` calls named under "What it checks". A destructive call
+  reached through a variable, a wrapper function or `getattr` is not matched, and a call behind
+  `if False:` or a debug flag counts as live.
 - A path disagreement is detected only when the literal is shaped like a path or a URL. The shapes
   it knows are a UNC share, a drive letter, an `http://`, `https://` or `ftp://` URL, a bare
   `ftp.` host, an ArcCatalog `Database Connections` entry, and a `.sde`, `.gdb` or `.mdb` file.
@@ -511,8 +576,8 @@ This asks whether two copies that the table says are the same still hold the sam
   assigns its documentation to a variable will have that text scanned for paths.
 - Renaming a variable changes the token stream, so two copies that differ only by a rename are two
   versions. `--near` will still pair them.
-- `--near` compares every readable pair, which is O(n^2). On the 743-file share it adds about
-  fourteen seconds to a four-second scan. At 50,000 files it needs a size and basename prefilter
+- `--near` compares every readable pair, which is O(n^2). On a share of several hundred files it
+  roughly quadruples the scan time. At 50,000 files it needs a size and basename prefilter
   first, which is marked in the source.
 - Every file is held in memory as text, plus its token stream and its shingle set. A few thousand
   scripts are fine. A tree of generated code is not, and files over 16 MB are named as skipped
@@ -528,9 +593,11 @@ This asks whether two copies that the table says are the same still hold the sam
 - A path is found in a table only inside backticks, or as a whole cell that starts with a drive
   letter, `\\`, or `/`. A bare file name in backticks is treated as a label, not a place.
 - A row is judged by its words. `identical`, `in parity`, `byte-for-byte`, `same`, `match` and
-  `yes` claim sameness, and `not`, `differ`, `diverged`, `stale`, `mismatch`, `split` and `no`
-  deny it. A cell that says "not identical" contains both and is skipped as mixed. A table written
-  in another language will find no claim and exit 2.
+  `yes` claim sameness, and `not`, `never`, `n't`, `non-`, `differ`, `diverged`, `stale`,
+  `mismatch`, `split` and `no` deny it. A cell that says "not identical" contains both and is
+  not judged. Such a row cannot end the run `CLEAN`: it ends `INCOMPLETE` with exit 3, and the
+  `said both` count says how many there were. A table written in another language will find no
+  claim and exit 2.
 - A byte count or digest is attached to a path only when it is in the same cell, or, in the
   folder-per-column shape, in that folder's column. A size in a separate column of a row-per-copy
   table is ignored.
@@ -555,6 +622,45 @@ This asks whether two copies that the table says are the same still hold the sam
   Linux run shown above. A named pipe was not tried.
 - Not exercised: a real 16 MB table (the test lowers the limit instead). No code path in this tool
   opens a socket or reads a credential, so there is no stub server to run and nothing to grep for.
+- The scan and the parity run write nothing except `--out` with `--apply`. The self-test is the
+  one other writer: it builds and removes temporary trees under the system temporary folder.
+- `--show-diff` prints raw code lines from both copies. Only the `user:password@` of a url is
+  masked, so a secret in any other shape, such as a `pwd=` connection string, reaches stdout.
+- Comment-only differences are collapsed on purpose, so a comment that carries a warning and was
+  changed is never reported. Only code, host and destructive differences are.
+- A source file with old-Mac lone CR line endings, or saved as UTF-16, is ranked as code drift or
+  unreadable against its LF or UTF-8 twin.
+- An `--ext` value in upper case, such as `.PY`, matches nothing, because file names are lower-cased
+  first. The run then exits 2.
+- A directory whose name ends in `.py` is skipped, and a file symlink is followed and read as if it
+  were a regular copy. A named pipe or device called `*.py` would block the walk. That was not
+  tried.
+- `--out` overwrites any path given with `--apply`, including a source file inside the scanned
+  tree, with no existence check.
+- `--map` and relative paths with `..` segments under `--base` can reach outside the mapped
+  folder. The files are only read and hashed, never written, and the report prints twelve hex
+  characters of a sha256.
+- `hashlib.md5` is used for file identity and for an md5 digest a table states. On a Python built
+  for FIPS it raises `ValueError`, not `OSError`, and the run ends in a traceback.
+- A folder-per-column table needs its folder names in backticks in the header, such as
+  `` `deployed/` ``. Without them the header yields no folder, every row names fewer than two
+  paths, and the run exits 2. A dash or blank cell for a copy that is absent by design is still
+  opened as a path and reported `MISSING`.
+- A column that is not headed `Canonical`, `Authority`, `Notes`, `Comments` or `Remarks` and holds
+  a backticked path is read as one more copy of the row.
+- A bare file-name cell that contains `match.py` or `same_x` can be read as a claim of sameness.
+  Labels with hyphens or dots around the word count too.
+- A `|` inside a cell, escaped as `\|`, splits the cell, so a path or claim after it is lost.
+- A size written as `bytes`, `KB` or `MB`, such as `9999 bytes` or `33 KB`, is not read. Only
+  `N B` is, so a stale size in another form is never flagged.
+- A row whose claim sits in a column other than the last, with a deny word such as `no` in a
+  free-text cell, is not judged. The run ends `INCOMPLETE`, which is the only signal.
+- A group made only of unreadable copies is ranked CODE, so the default `--fail-on destructive`
+  does not fail it. The run ends `INCOMPLETE` and the last line gives the count.
+- The `if __name__ == "__main__"` guard is the one line excluded from coverage, because the
+  self-test calls `main()` directly. Every other line and branch is reached offline.
+- The twelve-file share and the eight-row parity table in this README are not shipped, so those two
+  runs cannot be reproduced from the repo. Only the fixtures inside `--self-test` are.
 
 ## Contributing
 
