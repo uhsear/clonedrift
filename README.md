@@ -185,7 +185,7 @@ PASS  an unknown --min-class is rejected
 PASS  a unique prefix of --apply is refused by the parser  <-- pinned defect
 ...
 ----------------------------------------------------------------------
-423 assertions, 0 failed
+429 assertions, 0 failed
 ```
 
 That block is copied from a real run. Lines marked `...` were left out to keep it short; every
@@ -205,7 +205,7 @@ python clonedrift.py --self-test
 ```
 
 The self-test was run on Windows with Python 3.13, 3.12, 3.11, 3.10 and 3.9, and on Linux with
-Python 3.12. All six report 423 assertions and 0 failed. The count is equal on every host because no
+Python 3.12. All six report 429 assertions and 0 failed. The count is equal on every host because no
 assertion branches on the operating system: the path-class tests pass the host in as an argument,
 and the filesystem tests build their paths with `os.path.join`.
 
@@ -429,8 +429,10 @@ copy of itself. Two hard links to one file are not caught (see Limits).
   call `rmtree`, `os.remove`, `os.rmdir`, `unlink(`, `Delete(`, `Delete_management`,
   `DeleteField`, `DeleteFeatures`, `DeleteRows`, `deleteRow` or `TruncateTable` are counted, and
   two versions that count differently make the group DESTRUCTIVE. A statement is live when the
-  call is code: not in a comment and not inside a string. A comment edit or a re-indent beside
-  the call is therefore not a disagreement, and a call wrapped in a triple-quoted block, the way
+  call is code: not in a comment and not inside a string. Each statement is also keyed by the
+  chain of `if`, `else`, `try`, `def`, `with` and loop headers around it, so a call moved under
+  another header, or out of one, is a disagreement. A comment edit or a re-indent beside
+  the call is not a disagreement, and a call wrapped in a triple-quoted block, the way
   legacy scripts switch a line off without editing it, is one. The evidence is read from the raw
   lines, because the case that matters is a line one copy runs and the other has commented out,
   and a token stream has already discarded the commented copy. It marks which side is commented.
@@ -564,6 +566,9 @@ whether two copies that a table says are the same still hold the same bytes.
   the `shutil`, `os`, `pathlib` and `arcpy` calls named under "What it checks". A destructive call
   reached through a variable, a wrapper function or `getattr` is not matched, and a call behind
   `if False:` or a debug flag counts as live.
+- The block context is the header text, not its position. A call moved between two blocks that open
+  with the identical header line, such as two `if dry_run:` tests, is not reported, and a call on
+  a one-line `if x: call()` has no enclosing header of its own beyond that line.
 - A path disagreement is detected only when the literal is shaped like a path or a URL. The shapes
   it knows are a UNC share, a drive letter, an `http://`, `https://` or `ftp://` URL, a bare
   `ftp.` host, an ArcCatalog `Database Connections` entry, and a `.sde`, `.gdb` or `.mdb` file.

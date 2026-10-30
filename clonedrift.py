@@ -314,29 +314,55 @@ def path_literals(tokens):
     return frozenset(found)
 
 
+def raw_calls(text):
+    """live_calls for a copy the tokenizer refuses: raw lines, indent as context."""
+    calls = collections.Counter()
+    open_blocks = []
+    for line in text.splitlines():
+        body = line.strip()
+        if not body or body.startswith("#"):
+            continue
+        indent = len(line.expandtabs()) - len(line.expandtabs().lstrip())
+        while open_blocks and open_blocks[-1][0] >= indent:
+            open_blocks.pop()
+        if DESTRUCTIVE_RE.search(line):
+            calls[" > ".join([hdr for _, hdr in open_blocks] + [body])] += 1
+        head = re.sub(r"\s+#.*$", "", body)
+        if head.endswith(":"):
+            open_blocks.append((indent, head))
+    return calls
+
+
 def live_calls(text):
     """The statements of one copy that run a destructive call, with counts.
 
     A call counts when it is code: a name outside every comment and string. A
     call inside a triple-quoted block is switched off, which is how a legacy
-    script disables a line without editing it. Re-indenting a line or editing
-    its comment does not change the statement, so it is not a disagreement.
-    A copy the tokenizer refuses falls back to its raw lines that do not open
-    with a comment.
+    script disables a line without editing it. Each statement is keyed by its
+    text and by the chain of block headers (if, else, try, def, with, loops)
+    that enclose it, joined with " > ". Moving the same call under another
+    header, or out of one, is therefore a disagreement. Re-indenting a whole
+    copy or editing a comment is not: only the nesting order is read, never
+    the width, and headers are compared without comments. A copy the
+    tokenizer refuses falls back to its raw lines that do not open with a
+    comment, with the chain taken from their indentation.
     """
     try:
         tokens = token_stream(text)
     except Unreadable:
-        return collections.Counter(
-            line.strip() for line in text.splitlines()
-            if DESTRUCTIVE_RE.search(line)
-            and not line.lstrip().startswith("#"))
+        return raw_calls(text)
     calls = collections.Counter()
     shown, code = [], []
+    headers, last = [], ""
     for tok in tokens:
-        if tok[0] == tokenize.NEWLINE:
+        if tok[0] == tokenize.INDENT:
+            headers.append(last)
+        elif tok[0] == tokenize.DEDENT:
+            headers.pop()
+        elif tok[0] == tokenize.NEWLINE:
+            last = "".join(shown)
             if DESTRUCTIVE_RE.search("".join(code)):
-                calls["".join(shown)] += 1
+                calls[" > ".join(headers + [last])] += 1
             shown, code = [], []
         elif tok[0] in SIGNIFICANT:
             word = tok[1]
@@ -1425,8 +1451,39 @@ def self_test():
                             "import shutil\nshutil.rmtree(d)\n"),
           "a call switched off in the first copy is drift too")
     check(live_calls("def f():\n    return os.remove(f)\n")
-          == collections.Counter({"return os.remove(f)": 1}),
-          "a live statement is kept whole, with a space between two words")
+          == collections.Counter({"def f(): > return os.remove(f)": 1}),
+          "a live statement is kept whole, with a space between two words,"
+          " under the header that encloses it")
+    in_if = ("import arcpy\nif dry_run:\n    print('skip')\nelse:\n    pass\n"
+             "if dry_run:\n    arcpy.management.Delete(fc)\nelse:\n    pass\n")
+    in_else = in_if.replace("    arcpy.management.Delete(fc)\nelse:\n    pass\n",
+                            "    pass\nelse:\n    arcpy.management.Delete(fc)\n")
+    moved = destructive_drift(in_if, in_else)
+    check(moved and any("if dry_run: > arcpy.management.Delete(fc)" in e
+                        for e in moved),
+          "a call moved from the if branch to the else branch is drift"
+          "  <-- pinned defect")
+    flat = lambda text: collections.Counter(
+        key.rsplit(" > ", 1)[-1] for key in live_calls(text).elements())
+    check(flat(in_if) == flat(in_else) and live_calls(in_if) != live_calls(in_else),
+          "the block context is what separates the moved call: without it"
+          " the two copies match")
+    guarded = "try:\n    arcpy.management.Delete(fc)\nexcept Exception:\n    pass\n"
+    bare = "try:\n    pass\nexcept Exception:\n    pass\narcpy.management.Delete(fc)\n"
+    check(destructive_drift(guarded, bare),
+          "a call moved from a try block to top level is drift"
+          "  <-- pinned defect")
+    check(destructive_drift(guarded, guarded.replace("    ", "\t")) == []
+          and destructive_drift(in_if, in_if.replace("    ", "        ")) == [],
+          "re-indenting a whole copy is not drift")
+    check(destructive_drift(guarded, guarded.replace("pass", "pass  # ok")
+                            .replace("try:", "try:  # guard")) == [],
+          "a comment on a block header is not drift")
+    check(live_calls("msg = 'x\nif a:  # c\n    shutil.rmtree(d)\nelse:\n"
+                     "    pass\nos.remove(f)\n")
+          == collections.Counter({"if a: > shutil.rmtree(d)": 1,
+                                  "os.remove(f)": 1}),
+          "a copy the tokenizer refuses keeps the block context of each line")
     check(live_calls("from shutil import rmtree\n")
           == collections.Counter({"from shutil import rmtree": 1}),
           "an import of a destructive name is a live statement too")
